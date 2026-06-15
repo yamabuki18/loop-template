@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Exchange post-receive. Fires as the worker-container git process on every push, but the
+# exchange bare repo is a HOST directory mounted into the container — so writing a marker here
+# turns a worker push into a host-visible event with NO docker exec and NO polling. watch.sh
+# watches this marker (inotify, polling fallback) and runs the acceptance gate on the push.
+# During a hook GIT_DIR points at the bare exchange repo.
+marker="${GIT_DIR:-.}/push-event"
+ts="$(date -u +%FT%TZ 2>/dev/null || echo unknown)"
+while read -r _old new ref; do
+  printf '%s\t%s\t%s\n' "$ts" "$ref" "$new" >> "$marker" 2>/dev/null || true
+done
+# Ensure mtime bumps even on a no-op push so the watcher always sees an event.
+: >> "$marker" 2>/dev/null || true
+exit 0

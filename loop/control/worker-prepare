@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Runs inside the worker container. Idempotent: safe to call repeatedly.
+set -euo pipefail
+
+BRANCH="${FEAT_BRANCH:-work/${TASK:-w}}"
+
+if [ ! -d /work/.git ]; then
+  git clone /origin.git /work
+fi
+cd /work
+
+git config user.name  "worker-${TASK:-x}"            || true
+git config user.email "worker-${TASK:-x}@sandbox.local" || true
+git fetch origin --prune >/dev/null 2>&1 || true
+
+if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+  git checkout "$BRANCH" >/dev/null 2>&1 || true
+elif git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+  git checkout -b "$BRANCH" "origin/$BRANCH" >/dev/null 2>&1 || git checkout "$BRANCH" || true
+else
+  git checkout -b "$BRANCH" >/dev/null 2>&1 || true
+fi
+
+# Keep harness/housekeeping files out of commits and pushes.
+mkdir -p /work/.harness
+grep -qxF '.harness/' /work/.git/info/exclude 2>/dev/null || echo '.harness/' >> /work/.git/info/exclude
+grep -qxF 'STATUS'    /work/.git/info/exclude 2>/dev/null || echo 'STATUS'    >> /work/.git/info/exclude
+
+echo "[worker-prepare] branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"

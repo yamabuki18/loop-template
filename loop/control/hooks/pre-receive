@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Reject pushes to protected branches. Only the supervisor integrates into these.
+protected_re='^refs/heads/(main|master|develop)$'
+while read -r _old _new ref; do
+  if [[ "$ref" =~ $protected_re ]]; then
+    echo "DENIED: pushes to protected branch '${ref#refs/heads/}' are reserved for the supervisor." >&2
+    exit 1
+  fi
+done
+exit 0
