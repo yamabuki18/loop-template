@@ -65,6 +65,11 @@ echo "  goal: $GOAL"
 mapfile -t CRED < <(cred_docker_args)   # subscription OAuth token OR metered API key (never both)
 set +e
 # --entrypoint bash overrides the image's `sleep infinity` keepalive entrypoint (see gate.sh).
+# `timeout` guards against a hung planner Claude (observed hanging for many hours), which would
+# otherwise block plan.sh -> loop.sh forever. On timeout the container is killed; with no
+# slices.json the loop reports PLAN_FAIL and moves on. Tune via PLAN_TIMEOUT (seconds).
+PLAN_TIMEOUT="${PLAN_TIMEOUT:-900}"
+timeout --kill-after=30 "$PLAN_TIMEOUT" \
 docker run --rm \
   --entrypoint bash \
   "${CRED[@]}" \

@@ -30,7 +30,12 @@ if [ -n "$BRIEF" ]; then
   echo "wrote task brief to $TASK:/work/.harness/task.md"
   if tmux has-session -t "$SESSION" 2>/dev/null \
      && tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -qx "$TASK"; then
-    tmux send-keys -t "$SESSION:$TASK" "Read /work/.harness/task.md — this is your assignment. Implement on your branch and commit (it auto-pushes). Do not run the test suite; the supervisor verifies." Enter
+    # Send the instruction text and the submitting Enter as SEPARATE send-keys calls. Sending them
+    # in one call races the Claude TUI: the trailing Enter can arrive before the pasted text is
+    # committed to the input box, leaving the nudge typed-but-unsubmitted so the worker never starts.
+    tmux send-keys -t "$SESSION:$TASK" "Read /work/.harness/task.md — this is your assignment. Implement on your branch and commit (it auto-pushes). Do not run the test suite; the supervisor verifies."
+    sleep 1
+    tmux send-keys -t "$SESSION:$TASK" Enter
     echo "nudged worker '$TASK' to start."
   fi
 fi

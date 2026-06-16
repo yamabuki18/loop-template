@@ -41,7 +41,12 @@ fi
 # Best-effort: nudge the worker's Claude in its tmux window.
 if tmux has-session -t "$SESSION" 2>/dev/null \
    && tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -qx "$TASK"; then
-  tmux send-keys -t "$SESSION:$TASK" "Read /work/.harness/feedback.md — the supervisor's tests failed on your branch. Fix the issues, then commit (it auto-pushes)." Enter
+  # Send text and the submitting Enter as SEPARATE send-keys calls (a combined call races the TUI
+  # and leaves the nudge typed-but-unsubmitted, so the worker never re-engages on feedback). Same
+  # fix as assign.sh.
+  tmux send-keys -t "$SESSION:$TASK" "Read /work/.harness/feedback.md — the supervisor's tests failed on your branch. Fix the issues, then commit (it auto-pushes)."
+  sleep 1
+  tmux send-keys -t "$SESSION:$TASK" Enter
   echo "nudged worker '$TASK' in tmux."
 fi
 
