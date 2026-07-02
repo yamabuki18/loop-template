@@ -21,12 +21,15 @@ if ! tmux has-session -t "$SESSION" 2>/dev/null; then
   # binds to THIS workspace even when the engine is centrally installed.
   tmux set-environment -t "$SESSION" LOOP_PROJECT "$ROOT"
   tmux send-keys -t "$SESSION:supervisor" \
-    "clear; echo 'SUPERVISOR — canonical repo.'; echo 'goals: edit $MEMORY_DIR/backlog.md   progress: $MEMORY_DIR/PROGRESS.md'; echo 'full auto: loop.sh   semi-auto: watch.sh   status: status.sh   (in $CONTROL_DIR)'" C-m
+    "clear; echo 'SUPERVISOR — canonical repo.'; echo 'goals: edit $MEMORY_DIR/backlog.md   progress: $MEMORY_DIR/PROGRESS.md'; echo 'workers: ALL live in the fleet window (next window) — Ctrl-b z zooms a pane in/out.'; echo 'full auto: loop.sh   semi-auto: watch.sh   status: status.sh   (in $CONTROL_DIR)'" C-m
   tmux split-window -v -t "$SESSION:supervisor" -c "$ROOT"
   tmux send-keys -t "$SESSION:supervisor.1" \
     "clear; echo 'LOOP pane — edit memory/backlog.md first, then press Enter to launch loop.sh:'" C-m
   # Pre-type the launch command WITHOUT Enter, so the human reviews the backlog then starts it.
   tmux send-keys -t "$SESSION:supervisor.1" "$CONTROL_DIR/loop.sh"
+  # Dashboard pane (right of the loop pane): fleet-wide live status — backlog counters, every
+  # worker's run state / last push / STATUS / live pane tail, recent PROGRESS events. Read-only.
+  tmux split-window -h -t "$SESSION:supervisor.1" -c "$ROOT" "$CONTROL_DIR/dashboard.sh"
   tmux select-pane -t "$SESSION:supervisor.0"
 fi
 

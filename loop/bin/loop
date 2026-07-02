@@ -4,16 +4,19 @@
 #   git clone <this-repo> ~/.loop/loop-template
 #   ln -s ~/.loop/loop-template/loop/bin/loop ~/.local/bin/loop
 #
-#   loop init <dir> [repo-url]   create a new WORKSPACE (payload only; engine stays here)
-#   loop update                  update the engine (git pull) — applies to every workspace
-#   loop version                 engine version
-#   loop <cmd> [args...]         run control/<cmd>.sh against the current workspace
-#                                (up, down, status, doctor, setup, plan, verify, land, spawn,
-#                                 reap, respawn, assign, sync, gate, overlap, review, watch,
-#                                 broker, scaffold). `loop run` starts the autonomous loop.sh.
+#   loop here                    attach the CURRENT project, zero-footprint: the workspace
+#                                lives under $LOOP_HOME/workspaces/<path-slug>, the project
+#                                repo itself gets NO files (its git history stays clean)
+#   loop publish                 deliver landed work to the project as branch loop/<base>
+#   loop refresh                 absorb the project's new commits into the loop's base
+#   loop workspaces              list every attached project and its fleet
+#   loop init <dir> [repo-url]   create a standalone workspace directory instead of attaching
+#   loop update / loop version   update the engine (applies to every workspace) / show version
+#   loop <cmd> [args...]         any control/<cmd>.sh: up, down, run (=loop.sh), dashboard,
+#                                status, doctor, setup, plan, verify, land, spawn, assign, ...
 #
-# Workspace resolution is done by control/lib.sh: $LOOP_PROJECT if set, else the nearest
-# ancestor directory of $PWD containing a `.loop-workspace` marker.
+# Workspace resolution (control/lib.sh): $LOOP_PROJECT, else a `.loop-workspace` marker in an
+# ancestor of $PWD, else the central workspace for the enclosing git project, else legacy.
 set -euo pipefail
 
 SELF="${BASH_SOURCE[0]}"
@@ -22,7 +25,7 @@ ENGINE="$(cd "$(dirname "$SELF")/.." && pwd)"
 CTL="$ENGINE/control"
 
 usage() {
-  sed -n '2,16p' "$SELF" | sed 's/^# \{0,1\}//'
+  sed -n '2,19p' "$SELF" | sed 's/^# \{0,1\}//'
   echo
   echo "engine: $ENGINE (v$(cat "$ENGINE/VERSION" 2>/dev/null || echo '?'))"
 }

@@ -60,11 +60,23 @@ CONTAINER=$(cname "$TASK")
 EXCHANGE=$EX
 EOF
 
-# 4) tmux window into the worker's Claude (full TTY, so you can intervene any time).
+# 4) tmux pane in the shared 'fleet' window — company-style: EVERY worker visible on one
+#    screen as a titled tile (full TTY per pane; zoom with Ctrl-b z to intervene, z to unzoom).
 if tmux has-session -t "$SESSION" 2>/dev/null; then
-  if ! tmux list-windows -t "$SESSION" -F '#W' | grep -qx "$TASK"; then
+  if ! worker_pane "$TASK" >/dev/null; then
     cmd="docker exec -it -w /work $(cname "$TASK") bash -lc 'worker-prepare; cd /work; claude --dangerously-skip-permissions; exec bash'"
-    tmux new-window -t "$SESSION" -n "$TASK" "$cmd"
+    if ! tmux list-windows -t "$SESSION" -F '#W' | grep -qx fleet; then
+      pid="$(tmux new-window -d -t "$SESSION" -n fleet -P -F '#{pane_id}' "$cmd")"
+      # Show each pane's worker name on its border (the fleet's name tags).
+      tmux set-option -w -t "$SESSION:fleet" pane-border-status top
+      tmux set-option -w -t "$SESSION:fleet" pane-border-format ' #{pane_title} '
+    else
+      # Tile first so a crowded window still has room for one more pane.
+      tmux select-layout -t "$SESSION:fleet" tiled >/dev/null 2>&1 || true
+      pid="$(tmux split-window -d -t "$SESSION:fleet" -P -F '#{pane_id}' "$cmd")"
+      tmux select-layout -t "$SESSION:fleet" tiled >/dev/null 2>&1 || true
+    fi
+    tmux select-pane -t "$pid" -T "$TASK"
   fi
 fi
 

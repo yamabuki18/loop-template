@@ -7,12 +7,20 @@ set -euo pipefail
 CONTROL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENGINE_DIR="$(cd "$CONTROL_DIR/.." && pwd)"
 
+# Where central (out-of-tree) workspaces live: $LOOP_HOME/workspaces/<path-slug>. This is what
+# keeps a project's git history clean — the loop never writes a single file into the project.
+: "${LOOP_HOME:=$HOME/.loop}"
+
+# Stable slug for an absolute path (same scheme Claude Code uses for ~/.claude/projects).
+path_slug() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }
+
 # --- project resolution: one engine, many workspaces ------------------------------------------
-# Two layouts are supported:
-#   workspace : the engine is installed once (e.g. ~/.loop/loop-template) and each project is a
-#               small PAYLOAD directory (config.env + secret.env + skills/ + memory/ + runtime
-#               state), marked by a `.loop-workspace` file (created by `loop init`). Resolved via
-#               $LOOP_PROJECT, else by searching upward from $PWD for the marker.
+# Three layouts are supported, resolved in this order:
+#   explicit  : $LOOP_PROJECT points at the workspace (always wins).
+#   workspace : a directory holding a `.loop-workspace` marker — either an ancestor of $PWD
+#               (in-tree workspace made by `loop init`), or the CENTRAL one for this project at
+#               $LOOP_HOME/workspaces/<slug-of-git-toplevel-or-PWD> (made by `loop here`; the
+#               project repo itself stays untouched — zero-footprint daily-dev mode).
 #   legacy    : the whole template was copied into the project (scaffold.sh). ROOT is control/'s
 #               parent and config/secret live inside control/ — exactly the historical behavior.
 # Every script goes through $ROOT / $CONFIG_DIR / $CONTROL_DIR; none may hardcode layout.
@@ -27,6 +35,12 @@ else
     _d="$(dirname "$_d")"
   done
   unset _d
+fi
+if [ -z "$ROOT" ]; then  # central workspace for the project containing $PWD?
+  _p="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"
+  _ws="$LOOP_HOME/workspaces/$(path_slug "$_p")"
+  if [ -f "$_ws/.loop-workspace" ]; then ROOT="$_ws"; CONFIG_DIR="$_ws"; fi
+  unset _p _ws
 fi
 if [ -z "$ROOT" ]; then  # legacy copy-deployed layout
   ROOT="$ENGINE_DIR"; CONFIG_DIR="$CONTROL_DIR"
@@ -213,6 +227,22 @@ progress_compact() {
 # mtime (epoch) of a worker's push-event marker, or 0 if none yet. The exchange post-receive
 # hook bumps this on every worker push; host-side loops poll it (cheap, mount-safe on WSL2).
 marker_mtime() { stat -c %Y "$EXCHANGE_DIR/$1.git/push-event" 2>/dev/null || echo 0; }
+
+# tmux target of a worker's Claude UI (send-keys / capture-pane). Company-style layout: every
+# worker is a TITLED PANE in the shared 'fleet' window, so the whole fleet is visible on one
+# screen. Resolution: (1) pane titled <task> in fleet (title survives state-file rewrites, so
+# spawn stays idempotent), (2) legacy dedicated window named <task> (pre-fleet sessions keep
+# working). Prints the target and returns 0, or returns 1 when no tmux/pane exists.
+worker_pane() {
+  local t="$1" pid
+  pid="$(tmux list-panes -t "$SESSION:fleet" -F '#{pane_id} #{pane_title}' 2>/dev/null \
+         | awk -v t="$t" '$2==t{print $1; exit}')"
+  if [ -n "$pid" ]; then echo "$pid"; return 0; fi
+  if tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -qx "$t"; then
+    echo "$SESSION:$t"; return 0
+  fi
+  return 1
+}
 
 # Deterministically validate a planner slices.json BEFORE any worker burns tokens on it.
 # The prompt asks for disjoint, protected-free paths (advisory, L1); this is the structural

@@ -4,7 +4,10 @@
 # legacy scaffold.sh, which copies the WHOLE template (and therefore never receives engine
 # updates). Invoked as `loop init`; runnable directly too.
 #
-#   ./control/init.sh <workspace-dir> [repo-url]
+#   ./control/init.sh <workspace-dir> [repo-url] [--name <project-name>]
+#
+# --name overrides the PROJECT_NAME baked into config.env (default: workspace dir basename).
+# Used by here.sh, whose central workspace dirs are long path slugs — poor container names.
 #
 # Deliberately does NOT source lib.sh: lib.sh resolves the CURRENT workspace, and init must not
 # inherit one — it creates a fresh one from the engine's templates only.
@@ -13,8 +16,14 @@ set -euo pipefail
 CONTROL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENGINE="$(cd "$CONTROL_DIR/.." && pwd)"
 
-WS="${1:?usage: loop init <workspace-dir> [repo-url]}"
-REPO="${2:-}"
+WS=""; REPO=""; NAME_OVERRIDE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --name) NAME_OVERRIDE="${2:-}"; shift 2;;
+    *) if [ -z "$WS" ]; then WS="$1"; else REPO="$1"; fi; shift;;
+  esac
+done
+[ -n "$WS" ] || { echo "usage: loop init <workspace-dir> [repo-url] [--name <project-name>]" >&2; exit 1; }
 
 mkdir -p "$WS"
 WS="$(cd "$WS" && pwd)"
@@ -23,7 +32,8 @@ WS="$(cd "$WS" && pwd)"
 
 # PROJECT_NAME namespaces containers/volumes/tmux, so it MUST differ between workspaces —
 # derive it from the directory name (sanitized for docker/tmux) instead of a shared default.
-name="$(basename "$WS" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]/-/g' -e 's/^-*//' -e 's/-*$//')"
+name="$(printf '%s' "${NAME_OVERRIDE:-$(basename "$WS")}" \
+        | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]/-/g' -e 's/^-*//' -e 's/-*$//')"
 [ -n "$name" ] || name="loopws"
 
 echo "init: creating workspace '$name' in $WS (engine: $ENGINE)"

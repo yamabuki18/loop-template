@@ -209,6 +209,54 @@ if ( export LOOP_PROJECT="$ws" WIKI_ENABLED=0
 else ko "wiki_index_refresh ran despite WIKI_ENABLED=0"; fi
 rm -rf "$ws"
 
+echo "== zero-footprint daily-dev flow (here / resolve / publish / refresh) =="
+zf="$(mktemp -d)"; proj="$zf/proj"
+export LOOP_HOME="$zf/loophome"
+mkdir -p "$proj"
+( cd "$proj" && git init -qb main . && git config user.email a@b && git config user.name a \
+  && echo hello > app.txt && git add -A && git commit -qm A )
+
+slug="$( (cd "$zf"; unset LOOP_PROJECT; source "$CTL/lib.sh"; path_slug "$proj") 2>/dev/null )"
+[ -n "$slug" ] && ok "path_slug: '$proj' -> '$slug'" || ko "path_slug: empty"
+
+( cd "$proj" && bash "$CTL/here.sh" ) >/dev/null 2>&1
+wsc="$LOOP_HOME/workspaces/$slug"
+if [ -f "$wsc/.loop-workspace" ] && grep -q "^PROJECT_PATH=$proj$" "$wsc/.loop-workspace"; then
+  ok "here: central workspace created + bound to project"
+else ko "here: workspace missing or unbound ($wsc)"; fi
+
+r="$( cd "$proj" && bash -c "unset LOOP_PROJECT; source '$CTL/lib.sh'; echo \$ROOT" 2>/dev/null )"
+[ "$r" = "$wsc" ] && ok "lib: project dir resolves to its central workspace" \
+                  || ko "lib: resolution got '$r' (want $wsc)"
+
+dirty="$( cd "$proj" && git status --porcelain )"
+[ -z "$dirty" ] && ok "zero footprint: project repo has no new/changed files" \
+                || ko "project polluted: $dirty"
+
+# canonical = clone of the project (what setup.sh would create); loop lands commit B there.
+git clone -q "$proj" "$wsc/canonical"
+( cd "$wsc/canonical" && git config user.email l@l && git config user.name loop \
+  && echo feature > f.txt && git add -A && git commit -qm B )
+if ( export LOOP_PROJECT="$wsc"; bash "$CTL/publish.sh" ) >/dev/null 2>&1 \
+   && [ "$(git -C "$proj" rev-parse -q --verify refs/heads/loop/main)" = "$(git -C "$wsc/canonical" rev-parse main)" ]; then
+  ok "publish: landed work arrives in the project as loop/main"
+else ko "publish: loop/main missing or wrong sha"; fi
+
+# Human commits C in the project -> histories diverge -> refresh must REFUSE (publish-first).
+( cd "$proj" && echo human > h.txt && git add -A && git commit -qm C )
+if ( export LOOP_PROJECT="$wsc"; bash "$CTL/refresh.sh" ) >/dev/null 2>&1; then
+  ko "refresh: must refuse when histories diverged"
+else ok "refresh: refuses non-ff on divergence (publish-first enforced)"; fi
+
+# Project merges the loop's branch; now refresh fast-forwards canonical cleanly.
+( cd "$proj" && git merge -q --no-edit loop/main ) >/dev/null 2>&1
+if ( export LOOP_PROJECT="$wsc"; bash "$CTL/refresh.sh" ) >/dev/null 2>&1 \
+   && [ "$(git -C "$wsc/canonical" rev-parse main)" = "$(git -C "$proj" rev-parse main)" ]; then
+  ok "refresh: canonical fast-forwarded to the project's main"
+else ko "refresh: canonical did not reach project main"; fi
+unset LOOP_HOME
+rm -rf "$zf"
+
 echo
 echo "tests-toolkit: $pass passed, $fail failed."
 [ "$fail" -eq 0 ]
