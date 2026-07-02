@@ -19,7 +19,7 @@ set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
 CMD="${1:-up}"
-SECRETS="$CONTROL_DIR/secret.broker.env"
+SECRETS="$CONFIG_DIR/secret.broker.env"
 BR="$(brokername)"
 
 reap_broker() {
@@ -39,7 +39,7 @@ case "$CMD" in
   *) die "usage: broker.sh up|down|status" ;;
 esac
 
-[ -f "$SECRETS" ] || die "no $SECRETS — copy control/secret.broker.env.example and add your dev API credentials."
+[ -f "$SECRETS" ] || die "no $SECRETS — copy secret.broker.env.example there and add your dev API credentials."
 
 # Build BROKER_ROUTES JSON from secret.broker.env. (jq assembles it so values are escaped safely.)
 routes='{}'

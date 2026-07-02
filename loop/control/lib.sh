@@ -5,7 +5,47 @@
 set -euo pipefail
 
 CONTROL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="$(cd "$CONTROL_DIR/.." && pwd)"
+ENGINE_DIR="$(cd "$CONTROL_DIR/.." && pwd)"
+
+# Where central (out-of-tree) workspaces live: $LOOP_HOME/workspaces/<path-slug>. This is what
+# keeps a project's git history clean — the loop never writes a single file into the project.
+: "${LOOP_HOME:=$HOME/.loop}"
+
+# Stable slug for an absolute path (same scheme Claude Code uses for ~/.claude/projects).
+path_slug() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }
+
+# --- project resolution: one engine, many workspaces ------------------------------------------
+# Three layouts are supported, resolved in this order:
+#   explicit  : $LOOP_PROJECT points at the workspace (always wins).
+#   workspace : a directory holding a `.loop-workspace` marker — either an ancestor of $PWD
+#               (in-tree workspace made by `loop init`), or the CENTRAL one for this project at
+#               $LOOP_HOME/workspaces/<slug-of-git-toplevel-or-PWD> (made by `loop here`; the
+#               project repo itself stays untouched — zero-footprint daily-dev mode).
+#   legacy    : the whole template was copied into the project (scaffold.sh). ROOT is control/'s
+#               parent and config/secret live inside control/ — exactly the historical behavior.
+# Every script goes through $ROOT / $CONFIG_DIR / $CONTROL_DIR; none may hardcode layout.
+ROOT=""; CONFIG_DIR=""
+if [ -n "${LOOP_PROJECT:-}" ]; then
+  [ -d "$LOOP_PROJECT" ] || { echo "ERROR: LOOP_PROJECT='$LOOP_PROJECT' is not a directory" >&2; exit 1; }
+  ROOT="$(cd "$LOOP_PROJECT" && pwd)"; CONFIG_DIR="$ROOT"
+else
+  _d="$PWD"
+  while [ "$_d" != "/" ]; do
+    if [ -f "$_d/.loop-workspace" ]; then ROOT="$_d"; CONFIG_DIR="$_d"; break; fi
+    _d="$(dirname "$_d")"
+  done
+  unset _d
+fi
+if [ -z "$ROOT" ]; then  # central workspace for the project containing $PWD?
+  _p="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"
+  _ws="$LOOP_HOME/workspaces/$(path_slug "$_p")"
+  if [ -f "$_ws/.loop-workspace" ]; then ROOT="$_ws"; CONFIG_DIR="$_ws"; fi
+  unset _p _ws
+fi
+if [ -z "$ROOT" ]; then  # legacy copy-deployed layout
+  ROOT="$ENGINE_DIR"; CONFIG_DIR="$CONTROL_DIR"
+fi
+
 STATE_DIR="$ROOT/state"
 EXCHANGE_DIR="$ROOT/exchange"
 CANONICAL="$ROOT/canonical"
@@ -15,8 +55,8 @@ MEMORY_DIR="$ROOT/memory"
 LOG_DIR="$STATE_DIR/logs"
 
 # --- load config + secret (no error if absent) ---
-if [ -f "$CONTROL_DIR/config.env" ]; then source "$CONTROL_DIR/config.env"; fi
-if [ -f "$CONTROL_DIR/secret.env" ]; then source "$CONTROL_DIR/secret.env"; fi
+if [ -f "$CONFIG_DIR/config.env" ]; then source "$CONFIG_DIR/config.env"; fi
+if [ -f "$CONFIG_DIR/secret.env" ]; then source "$CONFIG_DIR/secret.env"; fi
 
 : "${PROJECT_NAME:=claudeparallel}"
 : "${IMAGE:=claude-worker:latest}"
@@ -36,6 +76,11 @@ if [ -f "$CONTROL_DIR/secret.env" ]; then source "$CONTROL_DIR/secret.env"; fi
 : "${PLANNER_ENABLED:=1}"
 : "${PLANNER_MAX_SLICES:=3}"
 : "${NOTIFY:=1}"
+# Context-hygiene knobs: cap what the loop feeds back into LLM contexts (planner/worker).
+: "${PROGRESS_MAX_LINES:=400}"   # compact memory/PROGRESS.md when it grows past this
+: "${PROGRESS_KEEP_LINES:=200}"  # ... keeping this many recent events verbatim
+: "${FEEDBACK_MAX_LINES:=200}"   # cap the gate log routed into a worker's feedback.md
+: "${WIKI_ENABLED:=1}"           # scoped LLM wiki: slice-owned wiki/modules/ pages + scripted index
 : "${CLAUDE_CODE_VERSION:=}"
 : "${BROKER_PORT:=8080}"
 : "${WORKER_EGRESS:=open}"
@@ -100,7 +145,7 @@ cred_docker_args() {
 # are injected ONLY into the gate container, which runs deterministic checks (NOT Claude) — so a
 # test can use, e.g., a DB URL or test API key that the worker Claude never sees. mapfile-friendly.
 gate_secret_docker_args() {
-  local f="$CONTROL_DIR/secret.gate.env" line
+  local f="$CONFIG_DIR/secret.gate.env" line
   [ -f "$f" ] || return 0
   while IFS= read -r line; do
     line="${line%%$'\r'}"
@@ -131,11 +176,187 @@ progress_log() {
   mkdir -p "$MEMORY_DIR"
   [ -f "$MEMORY_DIR/PROGRESS.md" ] || printf '# PROGRESS\n\n## Log\n' > "$MEMORY_DIR/PROGRESS.md"
   printf '%s\t%s\t%s\t%s\t%s\n' "$(now_utc)" "$ev" "$who" "$ref" "$note" >> "$MEMORY_DIR/PROGRESS.md"
+  progress_compact
+}
+
+# Keep PROGRESS.md a bounded, planner-friendly context: the planner reads the WHOLE file every
+# cycle, so unbounded append-only growth silently burns tokens and buries fresh signal in stale
+# noise. Past PROGRESS_MAX_LINES, fold events older than the last PROGRESS_KEEP_LINES into one
+# `# [compacted ...]` count line — except ESCALATED / LAND_FAIL events, which stay verbatim
+# (they are unresolved work a future plan must see). Header/summary lines are always preserved.
+progress_compact() {
+  local f="$MEMORY_DIR/PROGRESS.md"
+  [ -f "$f" ] || return 0
+  local total; total="$(wc -l < "$f")"
+  [ "$total" -gt "${PROGRESS_MAX_LINES:-400}" ] || return 0
+  local tmp; tmp="$(mktemp)"
+  awk -v keep="${PROGRESS_KEEP_LINES:-200}" -v now="$(now_utc)" '
+    # An "event" is a TSV line starting with a UTC timestamp; everything else is header.
+    # No {n} interval regex here — mawk (a common /usr/bin/awk) may not support it.
+    { line[NR]=$0; isev[NR] = ($0 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9:]+Z\t/) ? 1 : 0; ev_total += isev[NR] }
+    END {
+      cutoff = ev_total - keep                 # events beyond this index (1-based) stay verbatim
+      seen = 0
+      # First: header lines + the summary of folded events, in original order.
+      for (i = 1; i <= NR; i++) if (!isev[i]) print line[i]
+      # Count folded events (skipping the always-kept kinds).
+      for (i = 1; i <= NR; i++) {
+        if (!isev[i]) continue
+        seen++
+        if (seen > cutoff) break
+        split(line[i], f_, "\t")
+        if (f_[2] == "ESCALATED" || f_[2] == "LAND_FAIL") { keepline[i] = 1; continue }
+        cnt[f_[2]]++; folded++
+      }
+      if (folded > 0) {
+        s = "# [compacted " now "] " folded " older events folded:"
+        for (k in cnt) s = s " " k "=" cnt[k]
+        print s
+      }
+      # Then: preserved ESCALATED/LAND_FAIL from the folded range + the recent tail, in order.
+      seen = 0
+      for (i = 1; i <= NR; i++) {
+        if (!isev[i]) continue
+        seen++
+        if (seen <= cutoff) { if (keepline[i]) print line[i]; continue }
+        print line[i]
+      }
+    }' "$f" > "$tmp" && mv "$tmp" "$f"
 }
 
 # mtime (epoch) of a worker's push-event marker, or 0 if none yet. The exchange post-receive
 # hook bumps this on every worker push; host-side loops poll it (cheap, mount-safe on WSL2).
 marker_mtime() { stat -c %Y "$EXCHANGE_DIR/$1.git/push-event" 2>/dev/null || echo 0; }
+
+# tmux target of a worker's Claude UI (send-keys / capture-pane). Company-style layout: every
+# worker is a TITLED PANE in the shared 'fleet' window, so the whole fleet is visible on one
+# screen. Resolution: (1) pane titled <task> in fleet (title survives state-file rewrites, so
+# spawn stays idempotent), (2) legacy dedicated window named <task> (pre-fleet sessions keep
+# working). Prints the target and returns 0, or returns 1 when no tmux/pane exists.
+worker_pane() {
+  local t="$1" pid
+  pid="$(tmux list-panes -t "$SESSION:fleet" -F '#{pane_id} #{pane_title}' 2>/dev/null \
+         | awk -v t="$t" '$2==t{print $1; exit}')"
+  if [ -n "$pid" ]; then echo "$pid"; return 0; fi
+  if tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -qx "$t"; then
+    echo "$SESSION:$t"; return 0
+  fi
+  return 1
+}
+
+# Deterministically validate a planner slices.json BEFORE any worker burns tokens on it.
+# The prompt asks for disjoint, protected-free paths (advisory, L1); this is the structural
+# check (L3) that catches a planner that ignored it — a bad plan otherwise surfaces later as
+# merge conflicts (gate exit 3) or land denial (exit 4), each costing a full feedback round.
+# Checks: (a) schema — name/brief strings, non-empty paths[], optional tests[];
+#         (b) no slice path under/over a PROTECTED_PATHS prefix;
+#         (c) paths disjoint ACROSS slices (prefix-overlap in either direction).
+# Prints each violation to stderr; returns non-zero on any.
+validate_slices() {
+  local f="$1"
+  jq -e 'type=="array" and length>=1' "$f" >/dev/null 2>&1 \
+    || { echo "slices: not a non-empty JSON array" >&2; return 1; }
+  jq -e 'all(.[];
+        (.name  | type=="string" and length>0)
+    and (.brief | type=="string" and length>0)
+    and (.paths | type=="array" and length>0 and all(.[]; type=="string" and length>0))
+    and ((.tests // []) | type=="array" and all(.[]; type=="string")))' "$f" >/dev/null 2>&1 \
+    || { echo "slices: schema violation — every slice needs name, brief, non-empty paths[] (tests[] optional array)" >&2; return 1; }
+  jq -r 'to_entries[] | .key as $i | .value.paths[] | "\($i)\t\(.)"' "$f" \
+    | awk -F'\t' -v prot="${PROTECTED_PATHS:-}" '
+      { idx[NR]=$1; p=$2; sub(/^\.\//, "", p); path[NR]=p }
+      END {
+        bad = 0
+        n = split(prot, pr, /[[:space:]]+/)
+        for (i = 1; i <= NR; i++) {
+          for (k = 1; k <= n; k++) {
+            if (pr[k] != "" && (index(path[i], pr[k]) == 1 || index(pr[k], path[i]) == 1)) {
+              printf "slices: slice %s claims protected path: %s (protected: %s)\n", idx[i], path[i], pr[k] > "/dev/stderr"; bad = 1
+            }
+          }
+          for (j = i + 1; j <= NR; j++) {
+            if (idx[i] != idx[j] && (index(path[i], path[j]) == 1 || index(path[j], path[i]) == 1)) {
+              printf "slices: paths overlap across slices %s and %s: %s vs %s\n", idx[i], idx[j], path[i], path[j] > "/dev/stderr"; bad = 1
+            }
+          }
+        }
+        exit bad
+      }'
+}
+
+# Regenerate memory/REPO_MAP.md from canonical — a deterministic structural map (no Claude, no
+# tokens). Called after every land and at setup, so the planner reads a CURRENT map instead of
+# exploring /repo from scratch each cycle (and instead of trusting a hand-written, rotting one).
+repo_map_refresh() {
+  [ -d "$CANONICAL/.git" ] || return 0
+  mkdir -p "$MEMORY_DIR"
+  {
+    echo "# REPO_MAP — auto-generated structural map. Do not edit (regenerated on every land)."
+    echo
+    echo "Base: $BASE_BRANCH @ $(git -C "$CANONICAL" rev-parse --short HEAD 2>/dev/null || echo '?')  ($(now_utc))"
+    echo
+    echo "## Directories (tracked-file counts, depth <= 3)"
+    echo '```'
+    git -C "$CANONICAL" ls-files 2>/dev/null \
+      | awk -F/ '{
+          if (NF == 1) c["(root)"]++
+          else { p = ""; for (i = 1; i < NF && i <= 3; i++) { p = p $i "/"; c[p]++ } }
+        } END { for (k in c) printf "%6d  %s\n", c[k], k }' \
+      | sort -k2
+    echo '```'
+  } > "$MEMORY_DIR/REPO_MAP.md"
+}
+
+# One-line token-usage note from a `claude -p --output-format json` result file. Field paths
+# verified empirically against Claude Code 2.1.x. Prints nothing (and still returns 0) if the
+# file is missing or unparsable (e.g. the planner timed out mid-write) — never fails the caller.
+plan_usage_note() {
+  local f="${1:-}"
+  [ -n "$f" ] && [ -f "$f" ] || return 0
+  jq -r 'select(type=="object" and .usage != null)
+         | "in=\(.usage.input_tokens // 0) out=\(.usage.output_tokens // 0)"
+         + " cache_read=\(.usage.cache_read_input_tokens // 0)"
+         + " cache_write=\(.usage.cache_creation_input_tokens // 0)"
+         + " turns=\(.num_turns // 0) cost_usd=\(.total_cost_usd // 0)"' \
+    "$f" 2>/dev/null || true
+}
+
+# Deterministically (re)generate wiki/index.md in canonical from each page's frontmatter —
+# zero tokens, zero merge conflicts. This is the scoped "LLM wiki" pattern: workers keep their
+# slice's wiki/modules/<name>.md fresh as part of DONE (the moment they still hold the full
+# implementation context — the cheap moment to write it down), the planner reads index +
+# relevant pages instead of re-exploring the codebase, and the index — the one file everyone
+# would fight over — is owned by this script instead of any LLM.
+wiki_index_refresh() {
+  [ "${WIKI_ENABLED:-1}" = 1 ] || return 0
+  local wdir="$CANONICAL/wiki"
+  [ -d "$wdir" ] || return 0
+  local tmp; tmp="$(mktemp)"
+  {
+    echo "# Wiki Index"
+    echo
+    echo "> AUTO-GENERATED from page frontmatter on every land — edits here are overwritten."
+    echo "> Read this index first, then open ONLY the pages you need. Never bulk-load the wiki."
+    local sec t hdr f rel fm typ title sources printed
+    for sec in module:Modules concept:Concepts entity:Entities summary:Summaries other:Other; do
+      t="${sec%%:*}"; hdr="${sec#*:}"; printed=0
+      while IFS= read -r f; do
+        rel="${f#"$wdir"/}"
+        fm="$(awk '/^---$/{c++; next} c==1{print} c>=2{exit}' "$f")"
+        typ="$(sed -n 's/^type:[[:space:]]*//p' <<<"$fm" | head -1 | awk '{print $1}')"
+        case "$t" in
+          other) case "$typ" in module|concept|entity|summary) continue ;; esac ;;
+          *)     [ "$typ" = "$t" ] || continue ;;
+        esac
+        title="$(sed -n 's/^title:[[:space:]]*//p' <<<"$fm" | head -1)"
+        [ -n "$title" ] || title="$(basename "$f" .md)"
+        sources="$(awk '/^sources:/{s=1; next} s && /^[^ ]/{s=0} s && /^[[:space:]]*- /{sub(/^[[:space:]]*- /, ""); printf "%s%s", (n++ ? ", " : ""), $0}' <<<"$fm")"
+        [ "$printed" = 1 ] || { echo; echo "## $hdr"; printed=1; }
+        printf -- '- [%s](%s)%s\n' "$title" "$rel" "${sources:+ — sources: $sources}"
+      done < <(find "$wdir" -name '*.md' ! -name 'index.md' | sort)
+    done
+  } > "$tmp" && mv "$tmp" "$wdir/index.md"
+}
 
 # Best-effort, non-blocking notification. Never fails the caller.
 notify() {

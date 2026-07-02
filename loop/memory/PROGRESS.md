@@ -6,7 +6,8 @@
 >
 > 形式（1イベント1行・TSV風）:
 >   <UTC時刻>  <EVENT>  <task/slice>  <branch@sha>  <備考>
-> EVENT: PLANNED | ASSIGNED | GATE_PASS | GATE_FAIL | LANDED | ESCALATED | GOAL_DONE
+> EVENT: PLANNED | PLAN_USAGE | ASSIGNED | GATE_PASS | GATE_FAIL | LANDED | ESCALATED | GOAL_DONE
+> PLAN_USAGE = 計画役1回分のトークン消費（in/out/cache/turns/cost）。WIKI_ENABLED の効果測定に使う。
 
 ## Log
 <!-- loop.sh がこの行より下に追記する。手で消さないこと。 -->

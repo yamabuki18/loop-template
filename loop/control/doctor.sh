@@ -11,6 +11,10 @@ ok()   { printf '  \033[32mok\033[0m   %s\n' "$1"; }
 note() { printf '  \033[33mwarn\033[0m %s\n' "$1"; warn=$((warn+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail+1)); }
 
+ver="$(cat "$ENGINE_DIR/VERSION" 2>/dev/null || echo '?')"
+[ "$CONFIG_DIR" = "$CONTROL_DIR" ] && mode="legacy (copy-deployed)" || mode="workspace"
+echo "doctor: engine v$ver at $ENGINE_DIR — mode: $mode, project: $ROOT"
+
 echo "doctor: environment"
 command -v docker >/dev/null 2>&1 && { docker info >/dev/null 2>&1 && ok "docker reachable" || bad "docker installed but not reachable (is the daemon running?)"; } || bad "docker not found"
 command -v git    >/dev/null 2>&1 && ok "git"  || bad "git not found"
@@ -28,9 +32,9 @@ if [ "$QUICK" -eq 0 ]; then
   esac
 
   echo "doctor: secrets / billing mode"
-  if [ -f "$CONTROL_DIR/secret.env" ]; then
-    perms="$(stat -c '%a' "$CONTROL_DIR/secret.env" 2>/dev/null || echo '?')"
-    [ "$perms" = "600" ] && ok "secret.env perms 600" || note "secret.env perms are $perms — tighten with: chmod 600 control/secret.env"
+  if [ -f "$CONFIG_DIR/secret.env" ]; then
+    perms="$(stat -c '%a' "$CONFIG_DIR/secret.env" 2>/dev/null || echo '?')"
+    [ "$perms" = "600" ] && ok "secret.env perms 600" || note "secret.env perms are $perms — tighten with: chmod 600 $CONFIG_DIR/secret.env"
     case "$(auth_mode)" in
       subscription)
         ok "auth = subscription (CLAUDE_CODE_OAUTH_TOKEN set → Pro/Max quota, no metered API)"
@@ -41,9 +45,9 @@ if [ "$QUICK" -eq 0 ]; then
       none)
         note "no credential set — add CLAUDE_CODE_OAUTH_TOKEN (subscription) or ANTHROPIC_API_KEY (metered) to secret.env" ;;
     esac
-    grep -qE 'REPLACE-ME' "$CONTROL_DIR/secret.env" 2>/dev/null && note "secret.env still has a REPLACE-ME placeholder"
+    grep -qE 'REPLACE-ME' "$CONFIG_DIR/secret.env" 2>/dev/null && note "secret.env still has a REPLACE-ME placeholder"
   else
-    note "control/secret.env missing — copy secret.env.example and add a credential"
+    note "$CONFIG_DIR/secret.env missing — copy secret.env.example there and add a credential"
   fi
 fi
 

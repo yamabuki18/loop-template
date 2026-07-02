@@ -19,7 +19,7 @@ set -uo pipefail
 source "$(dirname "$0")/lib.sh"
 
 [ -d "$CANONICAL/.git" ] || die "canonical not found — run ./control/setup.sh first."
-have_credential || die "no credential (control/secret.env): set CLAUDE_CODE_OAUTH_TOKEN (subscription) or ANTHROPIC_API_KEY (metered API)."
+have_credential || die "no credential ($CONFIG_DIR/secret.env): set CLAUDE_CODE_OAUTH_TOKEN (subscription) or ANTHROPIC_API_KEY (metered API)."
 echo "loop: auth $(auth_mode) mode"
 mkdir -p "$LOG_DIR"
 
@@ -106,6 +106,14 @@ while true; do
     name="$(jq -r '.name' <<<"$slice")"
     brief="$(jq -r '.brief' <<<"$slice")"
     mapfile -t paths < <(jq -r '.paths[]' <<<"$slice")
+    # Hand the worker its EXACT pass bar: the contract tests the planner wrote for this slice.
+    # Without this the worker has to hunt through tests/ for which spec is "its" spec.
+    tests_md="$(jq -r '(.tests // [])[] | "  - " + .' <<<"$slice")"
+    [ -n "$tests_md" ] && brief="$brief"$'\n\n'"Acceptance tests that define DONE for this slice (read them, make them pass, never edit them):"$'\n'"$tests_md"
+    # If the planner gave this slice a wiki page, make its upkeep an explicit part of the task
+    # (the worker holds the full implementation context — the cheap moment to write it down).
+    wiki_page="$(jq -r '[.paths[] | select(startswith("wiki/"))][0] // empty' <<<"$slice")"
+    [ -n "$wiki_page" ] && brief="$brief"$'\n\n'"Also update $wiki_page — your module wiki page — to reflect what you built (role, public interface, data shapes, dependencies). It is part of DONE."
     echo "loop: assign $w <- slice '$name' (paths: ${paths[*]})"
     "$CONTROL_DIR/assign.sh" "$w" --brief "$brief"$'\n\n'"(slice: $name)" "${paths[@]}" >/dev/null 2>&1 || true
     BUSY["$w"]=1; SLICE["$w"]="$name"; ROUNDS["$w"]=0; SEEN["$w"]="$(marker_mtime "$w")"
