@@ -1,0 +1,16 @@
+# Secrets — NEVER commit these (they hold your worker credential / dev API keys).
+control/secret.env
+control/secret.broker.env
+control/secret.gate.env
+secret.env
+secret.broker.env
+secret.gate.env
+
+# Per-deployment hints / runtime state (recreated by setup.sh / the loop).
+control/.source-repo
+.source-repo
+.loop-workspace
+state/
+exchange/
+canonical/
+review/

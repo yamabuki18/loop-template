@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# `loop` — thin CLI over the centrally-installed engine. Install once, use from any project:
+#
+#   git clone <this-repo> ~/.loop/loop-template
+#   ln -s ~/.loop/loop-template/loop/bin/loop ~/.local/bin/loop
+#
+#   loop init <dir> [repo-url]   create a new WORKSPACE (payload only; engine stays here)
+#   loop update                  update the engine (git pull) — applies to every workspace
+#   loop version                 engine version
+#   loop <cmd> [args...]         run control/<cmd>.sh against the current workspace
+#                                (up, down, status, doctor, setup, plan, verify, land, spawn,
+#                                 reap, respawn, assign, sync, gate, overlap, review, watch,
+#                                 broker, scaffold). `loop run` starts the autonomous loop.sh.
+#
+# Workspace resolution is done by control/lib.sh: $LOOP_PROJECT if set, else the nearest
+# ancestor directory of $PWD containing a `.loop-workspace` marker.
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+[ -L "$SELF" ] && SELF="$(readlink -f "$SELF")"
+ENGINE="$(cd "$(dirname "$SELF")/.." && pwd)"
+CTL="$ENGINE/control"
+
+usage() {
+  sed -n '2,16p' "$SELF" | sed 's/^# \{0,1\}//'
+  echo
+  echo "engine: $ENGINE (v$(cat "$ENGINE/VERSION" 2>/dev/null || echo '?'))"
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  help|--help|-h) usage; exit 0 ;;
+  version|--version|-v)
+    echo "loop engine v$(cat "$ENGINE/VERSION" 2>/dev/null || echo '?') at $ENGINE"
+    git -C "$ENGINE" log -1 --format='  commit %h (%ci)' 2>/dev/null || true
+    exit 0 ;;
+  update)
+    echo "loop: updating engine at $ENGINE ..."
+    git -C "$ENGINE" pull --ff-only
+    echo "loop: engine now v$(cat "$ENGINE/VERSION" 2>/dev/null || echo '?'). All workspaces pick this up on their next command."
+    exit 0 ;;
+  init)  exec "$CTL/init.sh" "$@" ;;
+  run)   exec "$CTL/loop.sh" "$@" ;;   # `loop run` reads better than `loop loop`
+  *)
+    if [ -f "$CTL/$cmd.sh" ]; then exec bash "$CTL/$cmd.sh" "$@"; fi
+    echo "loop: unknown command '$cmd'" >&2; echo >&2; usage >&2; exit 1 ;;
+esac

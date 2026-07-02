@@ -41,6 +41,13 @@ fixes only**. The supervisor handles task assignment, testing, and integration.
 - Install packages, build/compile, create/edit/delete files in this container.
 - Run any shell command — the container is the security boundary, not a permission prompt.
 
+## Module wiki page (when your assignment includes one)
+- If your owned paths include a `wiki/modules/<name>.md`, keeping it accurate IS part of the
+  task. After implementing, write/refresh it to describe what NOW exists: role, public
+  interface, data shapes, dependencies, gotchas. A map, not a mirror — stay under ~150 lines.
+- Frontmatter: `title:`, `type: module`, `sources:` (the src paths it describes), `updated:`.
+- Never edit `wiki/index.md` — the supervisor regenerates it by script on every land.
+
 ## When you finish a unit of work
 - Commit each logical unit as you go (commits auto-push to your branch).
 - When the task is implemented (or feedback is addressed), append a one-line summary to

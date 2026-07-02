@@ -6,24 +6,27 @@ source "$(dirname "$0")/lib.sh"
 
 # Lightweight preflight (full check: ./control/doctor.sh).
 [ -x "$CONTROL_DIR/doctor.sh" ] && "$CONTROL_DIR/doctor.sh" --quick || true
-[ -d "$CANONICAL/.git" ] || die "canonical not found. Run ./control/setup.sh first."
-docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "image missing — building ..."; docker build -t "$IMAGE" "$CONTROL_DIR"; }
+[ -d "$CANONICAL/.git" ] || die "canonical not found. Run setup.sh first ($CONTROL_DIR/setup.sh)."
+docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "image missing — building ..."; docker build --build-arg HOST_UID="$(id -u)" -t "$IMAGE" "$CONTROL_DIR"; }
 have_credential \
   && echo "auth: $(auth_mode) mode" \
-  || echo "WARNING: no credential set — workers can't run Claude. Set CLAUDE_CODE_OAUTH_TOKEN (subscription) or ANTHROPIC_API_KEY (metered API) in control/secret.env."
+  || echo "WARNING: no credential set — workers can't run Claude. Set CLAUDE_CODE_OAUTH_TOKEN (subscription) or ANTHROPIC_API_KEY (metered API) in $CONFIG_DIR/secret.env."
 
 # Supervisor window. Top pane = canonical shell. Bottom pane = the autonomous loop, pre-typed
 # (NOT auto-run): review the backlog, then press Enter to start ./control/loop.sh. For semi-auto
 # instead, run ./control/watch.sh there.
 if ! tmux has-session -t "$SESSION" 2>/dev/null; then
   tmux new-session -d -s "$SESSION" -n supervisor -c "$CANONICAL"
+  # Panes/windows in this session inherit the resolved project, so every script run inside tmux
+  # binds to THIS workspace even when the engine is centrally installed.
+  tmux set-environment -t "$SESSION" LOOP_PROJECT "$ROOT"
   tmux send-keys -t "$SESSION:supervisor" \
-    "clear; echo 'SUPERVISOR — canonical repo.'; echo 'goals: edit memory/backlog.md   progress: memory/PROGRESS.md'; echo 'full auto: ./control/loop.sh   semi-auto: ./control/watch.sh   status: ./control/status.sh'" C-m
+    "clear; echo 'SUPERVISOR — canonical repo.'; echo 'goals: edit $MEMORY_DIR/backlog.md   progress: $MEMORY_DIR/PROGRESS.md'; echo 'full auto: loop.sh   semi-auto: watch.sh   status: status.sh   (in $CONTROL_DIR)'" C-m
   tmux split-window -v -t "$SESSION:supervisor" -c "$ROOT"
   tmux send-keys -t "$SESSION:supervisor.1" \
     "clear; echo 'LOOP pane — edit memory/backlog.md first, then press Enter to launch loop.sh:'" C-m
   # Pre-type the launch command WITHOUT Enter, so the human reviews the backlog then starts it.
-  tmux send-keys -t "$SESSION:supervisor.1" "./control/loop.sh"
+  tmux send-keys -t "$SESSION:supervisor.1" "$CONTROL_DIR/loop.sh"
   tmux select-pane -t "$SESSION:supervisor.0"
 fi
 

@@ -12,13 +12,19 @@ chmod +x "$CONTROL_DIR"/*.sh "$CONTROL_DIR"/worker-prepare \
          "$CONTROL_DIR"/host-harness/harness-* 2>/dev/null || true
 
 # Tighten secret perms if present (the disposable worker key should not be world-readable).
-[ -f "$CONTROL_DIR/secret.env" ] && chmod 600 "$CONTROL_DIR/secret.env" 2>/dev/null || true
+[ -f "$CONFIG_DIR/secret.env" ] && chmod 600 "$CONFIG_DIR/secret.env" 2>/dev/null || true
 
-# A repo URL can also be recorded by scaffold.sh in control/.source-repo.
-SRC="${1:-}"; [ -z "$SRC" ] && [ -f "$CONTROL_DIR/.source-repo" ] && SRC="$(cat "$CONTROL_DIR/.source-repo")"
+# A repo URL can also be recorded by `loop init` / scaffold.sh in .source-repo.
+SRC="${1:-}"
+[ -z "$SRC" ] && [ -f "$CONFIG_DIR/.source-repo" ]  && SRC="$(cat "$CONFIG_DIR/.source-repo")"
+[ -z "$SRC" ] && [ -f "$CONTROL_DIR/.source-repo" ] && SRC="$(cat "$CONTROL_DIR/.source-repo")"
 
 echo "[1/5] building worker image ($IMAGE)${CLAUDE_CODE_VERSION:+ @ claude-code $CLAUDE_CODE_VERSION} — slow the first time ..."
-docker build ${CLAUDE_CODE_VERSION:+--build-arg CLAUDE_CODE_VERSION="$CLAUDE_CODE_VERSION"} -t "$IMAGE" "$CONTROL_DIR"
+# HOST_UID: the in-container `dev` user must share the host uid, or the bind-mounted exchange
+# and the planner's /out are read-only to it (see Dockerfile). Passing it here removes the old
+# "your uid must be 1000" caveat.
+docker build --build-arg HOST_UID="$(id -u)" \
+  ${CLAUDE_CODE_VERSION:+--build-arg CLAUDE_CODE_VERSION="$CLAUDE_CODE_VERSION"} -t "$IMAGE" "$CONTROL_DIR"
 
 echo "[2/5] creating directories ..."
 mkdir -p "$STATE_DIR" "$EXCHANGE_DIR" "$REVIEW_DIR" "$LOG_DIR" "$SKILLS_DIR" "$MEMORY_DIR"
@@ -42,7 +48,9 @@ git -C "$CANONICAL" show-ref --verify --quiet "refs/heads/$BASE_BRANCH" \
 cp "$CONTROL_DIR/hooks/pre-receive" "$CANONICAL/.git/hooks/pre-receive"
 chmod +x "$CANONICAL/.git/hooks/pre-receive"
 
+repo_map_refresh   # first structural map for the planner (kept fresh by every land)
+
 echo "[5/5] preflight ..."
 "$CONTROL_DIR/doctor.sh" --quick || true
-[ -f "$CONTROL_DIR/secret.env" ] || echo "  NOTE: create control/secret.env from secret.env.example (DISPOSABLE worker key), then chmod 600."
+[ -f "$CONFIG_DIR/secret.env" ] || echo "  NOTE: create $CONFIG_DIR/secret.env from control/secret.env.example (DISPOSABLE worker key), then chmod 600."
 echo "  Write goals in memory/backlog.md, then start:   ./control/up.sh"

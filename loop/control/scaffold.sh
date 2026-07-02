@@ -5,6 +5,8 @@
 #       Lay the loop template into <target-dir> (control/ + skills/ + memory/ + README/.gitignore),
 #       ready for you to fill in config.env/secret.env/skills and run ./control/setup.sh there.
 #       If [repo-url] is given it is recorded as a hint for setup.sh (which clones canonical).
+#       NOTE: this is the LEGACY full-copy deployment (engine updates do NOT propagate). Prefer
+#       `loop init <dir>` (bin/loop) — one central engine, thin per-project workspaces.
 #
 #   ./control/scaffold.sh --install-host-guard
 #       Merge the OPTIONAL host secret-guard hooks (host-harness/settings.json) into this

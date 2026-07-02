@@ -32,6 +32,19 @@ git -C "$CANONICAL" checkout "$BASE_BRANCH"
 git -C "$CANONICAL" merge --no-ff -m "merge $BRANCH" "ex-$TASK/$BRANCH"
 echo "merged $BRANCH into $BASE_BRANCH (canonical)."
 
+# Refresh the planner's structural map from the NEW base (deterministic, tokenless), so the
+# next DISCOVER/PLAN cycle sees the code that just landed without re-exploring /repo.
+repo_map_refresh
+
+# Regenerate wiki/index.md from page frontmatter and land it with the merge (deterministic,
+# tokenless). Workers own their module pages; the index — the file everyone would fight over —
+# is owned by this script, so it can never be a merge conflict or drift from the pages.
+wiki_index_refresh
+if [ -f "$CANONICAL/wiki/index.md" ]; then
+  git -C "$CANONICAL" add wiki/index.md
+  git -C "$CANONICAL" diff --cached --quiet || git -C "$CANONICAL" commit -qm "wiki: refresh index (auto)"
+fi
+
 # D3: propagate the new base into EVERY worker's exchange repo. Without this, other workers
 # rebase onto a STALE base (the exchange's base ref is only refreshed lazily by gate/overlap),
 # so the "land -> rebase the others" cycle silently builds on the wrong commit.

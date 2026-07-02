@@ -33,7 +33,20 @@ fi
   echo "# Fix the issues below, then commit (commits auto-push). The supervisor will re-verify."
   echo "# This file is transient (gitignored); you may delete it once addressed."
   echo
-  cat "$log"
+  # Distill long gate logs (FEEDBACK_MAX_LINES): a full `npm ci` transcript buries the actual
+  # failure and pollutes the worker's context. Keep the head (what the gate ran) and the tail
+  # (where test runners print the failures); elide the middle.
+  loglines="$(wc -l < "$log")"
+  if [ "$loglines" -le "${FEEDBACK_MAX_LINES:-200}" ]; then
+    cat "$log"
+  else
+    keep_head=40; keep_tail=$(( ${FEEDBACK_MAX_LINES:-200} - keep_head ))
+    head -n "$keep_head" "$log"
+    echo
+    echo "... [$((loglines - keep_head - keep_tail)) lines elided — ask the supervisor if you need the full gate log] ..."
+    echo
+    tail -n "$keep_tail" "$log"
+  fi
 } | docker exec -i "$CONTAINER" bash -lc 'mkdir -p /work/.harness && cat > /work/.harness/feedback.md' 2>/dev/null \
   && echo "VERIFY FAIL (exit $rc): wrote failures to $TASK:/work/.harness/feedback.md" \
   || echo "VERIFY FAIL (exit $rc): could not reach container '$TASK' (running?)."

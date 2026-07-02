@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # or config.env. Empty = latest. Auto-update is disabled in worker settings so a rebuilt image
 # behaves identically until you deliberately bump the pin.
 ARG CLAUDE_CODE_VERSION=
+# The in-container dev user's uid — must match the host uid (see the useradd note below).
+ARG HOST_UID=1000
 RUN if [ -n "$CLAUDE_CODE_VERSION" ]; then \
         npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"; \
     else \
@@ -37,14 +39,14 @@ RUN chmod +x /usr/local/bin/worker-prepare \
              /usr/local/bin/harness-autopush \
              /usr/local/bin/harness-stop-gate \
  && (userdel -r node 2>/dev/null || true) \
- && useradd -m -u 1000 -s /bin/bash dev \
+ && useradd -m -u "${HOST_UID}" -s /bin/bash dev \
  && mkdir -p /home/dev/.claude /work \
  && chown -R dev:dev /home/dev/.claude /work
-# WHY uid 1000: the worker user MUST share the host uid so it can WRITE the host-bind-mounted
+# WHY HOST_UID: the worker user MUST share the host uid so it can WRITE the host-bind-mounted
 # exchange repo (worker push, spawn.sh) and the planner's /out dir (plan.sh). node:22-bookworm
-# already occupies uid 1000 with its `node` user, which would push `dev` to 1001 and make those
-# host-owned mounts read-only to the worker — the planner then can't write slices.json and the
-# worker can't push. (If your host uid is not 1000, build with the right id, e.g. add an ARG.)
+# already occupies uid 1000 with its `node` user (removed above), which would otherwise push
+# `dev` to 1001 and make those host-owned mounts read-only — the planner then can't write
+# slices.json and the worker can't push. setup.sh/up.sh pass --build-arg HOST_UID="$(id -u)".
 
 # Worker "memory" (advisory, L1/L2) + harness hooks (deterministic, absolute)
 COPY --chown=dev:dev CLAUDE.worker.md          /home/dev/.claude/CLAUDE.md
