@@ -1,54 +1,48 @@
 #!/usr/bin/env bash
-# Bring a single worker online. Idempotent: creates what's missing, starts what's stopped,
-# ensures a tmux window attached to that worker's Claude.
+# Bring a single worker online. Idempotent: creates what's missing, refreshes the harness
+# config, ensures a herdr pane running that worker's Claude.
 #   ./control/spawn.sh <task> [branch]
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
 TASK="${1:?usage: spawn.sh <task> [branch]}"
 BRANCH="${2:-$(branch_for "$TASK")}"
-EX="$EXCHANGE_DIR/$TASK.git"
+WT="$(worktree_for "$TASK")"
+HD="$(harness_dir "$TASK")"
+CD="$(claude_cfg_dir "$TASK")"
 
-# 1) Exchange bare repo = the worker's credential-less origin (file protocol, no tokens).
-if [ ! -d "$EX" ]; then
-  git clone --bare "$CANONICAL" "$EX" >/dev/null
-  git -C "$EX" branch -f "$BRANCH" "$BASE_BRANCH"
-  # The container user (dev, uid 1001) differs from the host owner (e.g. 1000), so without this
-  # the worker's push fails with "unable to create temporary object directory". core.sharedRepository
-  # makes git create new objects group/world-writable; the chmod opens the existing tree. The
-  # exchange holds only this branch's git data (no secrets) and the host is trusted, so this is safe.
-  git -C "$EX" config core.sharedRepository 0777
-fi
-# Install/refresh exchange hooks every spawn (idempotent): pre-receive guards protected
-# branches; post-receive emits a host-visible push marker for watch.sh (the loop heartbeat).
-for h in pre-receive post-receive; do
-  if [ -f "$CONTROL_DIR/hooks/$h" ]; then
-    cp "$CONTROL_DIR/hooks/$h" "$EX/hooks/$h" && chmod +x "$EX/hooks/$h"
+[ -d "$CANONICAL/.git" ] || die "canonical not found — run ./control/setup.sh first."
+
+# 1) Git worktree = the worker's box. It shares canonical's refs/objects, so a worker commit is
+#    instantly supervisor-visible (no exchange, no push) and the checked-out BASE_BRANCH in
+#    canonical is structurally un-checkout-able by workers (git refuses double checkouts).
+mkdir -p "$WORKTREES_DIR"
+if [ ! -e "$WT/.git" ]; then
+  if git -C "$CANONICAL" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    git -C "$CANONICAL" worktree add "$WT" "$BRANCH" >/dev/null
+  else
+    git -C "$CANONICAL" worktree add -b "$BRANCH" "$WT" "$BASE_BRANCH" >/dev/null
   fi
-done
-chmod -R a+rwX "$EX" 2>/dev/null || true   # keep the exchange writable by the container user
+fi
 
-# 2) Container. The ONLY host path mounted is this worker's own exchange repo (no secrets,
-#    just this branch's git data). No $HOME, no SSH keys, no /mnt/c — that's the read isolation.
-if ! container_exists "$TASK"; then
-  # Inject ONLY the chosen credential (subscription OAuth token OR metered API key — never both,
-  # so subscription billing is not silently overridden by a stray API key). See lib.sh.
-  mapfile -t CRED < <(cred_docker_args)
-  # Join the worker<->broker network. Workers get BROKER_URL (NOT the dev secrets): they call
-  # $BROKER_URL/<alias>/... and the broker injects the token. With WORKER_EGRESS=broker-only this
-  # network is --internal, so the broker is the only reachable outbound path.
-  ensure_worker_network
-  docker run -d --name "$(cname "$TASK")" \
-    --network "$(netname)" \
-    "${CRED[@]}" \
-    -e TASK="$TASK" -e FEAT_BRANCH="$BRANCH" -e BASE_BRANCH="$BASE_BRANCH" \
-    -e PROTECTED_PATHS="$PROTECTED_PATHS" \
-    -e BROKER_URL="http://$(brokername):$BROKER_PORT" \
-    -v "$EX":/origin.git \
-    -v "$(volname "$TASK")":/work \
-    "$IMAGE" >/dev/null
-elif ! container_running "$TASK"; then
-  docker start "$(cname "$TASK")" >/dev/null
+# 2) Out-of-tree worker state: harness dir (task.md/feedback.md/owned-paths/STATUS) and a
+#    per-worker CLAUDE_CONFIG_DIR (hooks + rules + onboarding pre-seed). Regenerated every
+#    spawn (idempotent) so engine updates reach live fleets — EXCEPT .claude.json, which
+#    accumulates live session state and is only seeded when missing.
+mkdir -p "$HD" "$CD"
+sed "s|__CONTROL_DIR__|$CONTROL_DIR|g" \
+  "$CONTROL_DIR/worker-harness/settings.template.json" > "$CD/settings.json"
+cp "$CONTROL_DIR/CLAUDE.worker.md" "$CD/CLAUDE.md"
+if [ ! -f "$CD/.claude.json" ]; then
+  sed "s|__WORKTREE__|$WT|g" "$CONTROL_DIR/worker-claude.template.json" > "$CD/.claude.json"
+fi
+# Host-login convenience: with no worker-scope secret, ride the operator's own claude login by
+# copying its credential into the isolated config dir (auth_mode 'host'). Concealment tradeoff
+# is the operator's own credential — doctor points at `loop secrets edit worker` for the clean way.
+if ! secret_present worker && [ -f "$HOME/.claude/.credentials.json" ] && [ ! -f "$CD/.credentials.json" ]; then
+  cp "$HOME/.claude/.credentials.json" "$CD/.credentials.json"
+  chmod 600 "$CD/.credentials.json" 2>/dev/null || true
+  echo "spawn: no worker-scope secret — seeded '$TASK' from the host claude login (see: loop secrets edit worker)"
 fi
 
 # 3) Record state for the other scripts.
@@ -56,28 +50,25 @@ mkdir -p "$STATE_DIR"
 cat > "$STATE_DIR/$TASK.env" <<EOF
 TASK=$TASK
 BRANCH=$BRANCH
-CONTAINER=$(cname "$TASK")
-EXCHANGE=$EX
+WORKTREE=$WT
 EOF
 
-# 4) tmux pane in the shared 'fleet' window — company-style: EVERY worker visible on one
-#    screen as a titled tile (full TTY per pane; zoom with Ctrl-b z to intervene, z to unzoom).
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-  if ! worker_pane "$TASK" >/dev/null; then
-    cmd="docker exec -it -w /work $(cname "$TASK") bash -lc 'worker-prepare; cd /work; claude --dangerously-skip-permissions; exec bash'"
-    if ! tmux list-windows -t "$SESSION" -F '#W' | grep -qx fleet; then
-      pid="$(tmux new-window -d -t "$SESSION" -n fleet -P -F '#{pane_id}' "$cmd")"
-      # Show each pane's worker name on its border (the fleet's name tags).
-      tmux set-option -w -t "$SESSION:fleet" pane-border-status top
-      tmux set-option -w -t "$SESSION:fleet" pane-border-format ' #{pane_title} '
-    else
-      # Tile first so a crowded window still has room for one more pane.
-      tmux select-layout -t "$SESSION:fleet" tiled >/dev/null 2>&1 || true
-      pid="$(tmux split-window -d -t "$SESSION:fleet" -P -F '#{pane_id}' "$cmd")"
-      tmux select-layout -t "$SESSION:fleet" tiled >/dev/null 2>&1 || true
-    fi
-    tmux select-pane -t "$pid" -T "$TASK"
+# 4) herdr pane running the worker's Claude (via worker-run.sh, which exports the harness env
+#    and injects the credential with secret_exec). Best-effort: without a herdr server the
+#    worker is still fully materialized — attach later with up.sh, or run worker-run.sh in any
+#    terminal. Agent name = task id; herdr's agent-state detection then powers the loop signal.
+if herdr_ok; then
+  if ! herdr agent get "$TASK" >/dev/null 2>&1; then
+    ws="$(herdr_workspace)"
+    herdr agent start "$TASK" \
+      ${ws:+--workspace "$ws"} \
+      --cwd "$WT" --no-focus \
+      --env "LOOP_PROJECT=$ROOT" \
+      -- bash "$CONTROL_DIR/worker-run.sh" "$TASK" >/dev/null 2>&1 \
+      || echo "spawn: herdr pane for '$TASK' could not be started (run: $CONTROL_DIR/worker-run.sh $TASK)"
   fi
+else
+  echo "spawn: herdr server not running — worker '$TASK' materialized; up.sh will attach it."
 fi
 
-echo "worker '$TASK' ready (branch $BRANCH)"
+echo "worker '$TASK' ready (branch $BRANCH, worktree $WT)"

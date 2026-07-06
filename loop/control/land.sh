@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Supervisor-only: merge a worker's branch into BASE_BRANCH inside canonical.
 # Runs the acceptance gate first; merge is aborted unless the gate passes.
+# v3: the branch already lives in canonical (worktrees share refs) — no remotes, no fetch,
+# and no base propagation (the v2 D3 exchange sync is now structural: every worker sees the
+# new base ref the instant this merge lands).
 #   ./control/land.sh <task>              # gated merge (default)
 #   ./control/land.sh <task> --no-verify  # supervisor override, skip the gate
 set -euo pipefail
@@ -21,19 +24,18 @@ if [ "$NO_VERIFY" -eq 1 ]; then
   echo "land: --no-verify set, SKIPPING acceptance gate (supervisor override)."
 else
   "$CONTROL_DIR/gate.sh" "$TASK" \
-    || die "acceptance gate failed — merge aborted. Fix on the worker and re-push, or override with: ./control/land.sh $TASK --no-verify"
+    || die "acceptance gate failed — merge aborted. Fix on the worker and re-verify, or override with: ./control/land.sh $TASK --no-verify"
 fi
 
-git -C "$CANONICAL" remote add "ex-$TASK" "$EXCHANGE" 2>/dev/null \
-  || git -C "$CANONICAL" remote set-url "ex-$TASK" "$EXCHANGE"
-git -C "$CANONICAL" fetch "ex-$TASK" "$BRANCH" >/dev/null
-
-git -C "$CANONICAL" checkout "$BASE_BRANCH"
-git -C "$CANONICAL" merge --no-ff -m "merge $BRANCH" "ex-$TASK/$BRANCH"
+git -C "$CANONICAL" checkout -q "$BASE_BRANCH"
+git -C "$CANONICAL" merge --no-ff -m "merge $BRANCH" "$BRANCH"
 echo "merged $BRANCH into $BASE_BRANCH (canonical)."
 
+# This slice's codex-round budget is spent state — reset it for the next assignment.
+codex_rounds_reset "$TASK"
+
 # Refresh the planner's structural map from the NEW base (deterministic, tokenless), so the
-# next DISCOVER/PLAN cycle sees the code that just landed without re-exploring /repo.
+# next DISCOVER/PLAN cycle sees the code that just landed without re-exploring the repo.
 repo_map_refresh
 
 # Regenerate wiki/index.md from page frontmatter and land it with the merge (deterministic,
@@ -45,18 +47,6 @@ if [ -f "$CANONICAL/wiki/index.md" ]; then
   git -C "$CANONICAL" diff --cached --quiet || git -C "$CANONICAL" commit -qm "wiki: refresh index (auto)"
 fi
 
-# D3: propagate the new base into EVERY worker's exchange repo. Without this, other workers
-# rebase onto a STALE base (the exchange's base ref is only refreshed lazily by gate/overlap),
-# so the "land -> rebase the others" cycle silently builds on the wrong commit.
-shopt -s nullglob
-for f in "$STATE_DIR"/*.env; do
-  ( source "$f"
-    git -C "$EXCHANGE" fetch -q "$CANONICAL" "refs/heads/$BASE_BRANCH:refs/heads/$BASE_BRANCH" 2>/dev/null || true
-  )
-done
-
-# Re-sync the OTHER live workers onto the new base in one command (D3). sync.sh runs the
-# fetch+rebase+force-push via `docker exec` (which bypasses the client guard hooks legitimately,
-# and work/* force-push is allowed by pre-receive). On conflict it aborts and routes the
-# conflicting files back to the worker instead of guessing.
+# Re-sync the OTHER live workers onto the new base (rebases their worktrees directly; on
+# conflict it aborts and routes the conflicting files back to the worker instead of guessing).
 echo "next: re-sync the other workers onto the new base:  ./control/sync.sh --others $TASK"

@@ -1,5 +1,6 @@
 # Toolkit regression suite — Docker-free by design (hooks are a pure stdin-JSON -> exit-code
-# contract), so it runs on every push in seconds.
+# contract), so it runs on every push in seconds. v3 also runs the full e2e: without Docker
+# the whole gate/verify/land/sync pipeline is exercisable on a bare runner.
 name: ci
 on:
   push:
@@ -14,3 +15,5 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq jq shellcheck
       - name: tests-toolkit
         run: bash loop/tests-toolkit/run.sh
+      - name: e2e (no credentials, no herdr)
+        run: bash loop/tests-toolkit/e2e-nocreds.sh

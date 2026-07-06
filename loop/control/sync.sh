@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Re-sync worker branch(es) onto the current BASE_BRANCH after a land (D3/A3). Runs the
-# fetch+rebase+force-push INSIDE the worker container via docker exec — this path legitimately
-# bypasses the client-side guard hooks (the supervisor is the trusted party), and pushing the
-# rebased work/* branch is allowed by the exchange pre-receive (only protected branches are
-# blocked). On rebase conflict it ABORTS and routes the conflicting file list back to the worker
-# as feedback instead of guessing a resolution.
+# Re-sync worker branch(es) onto the current BASE_BRANCH after a land (A3). v3 rebases each
+# worker's WORKTREE directly (supervisor-side git — the client guard hooks only fence the
+# worker's own Claude, not this script). Race guards, in order:
+#   - herdr agent state 'working'      -> SYNC_DEFERRED, skip (never rebase under a live edit;
+#                                         the next land or a manual sync retries)
+#   - dirty/staged worktree            -> feedback "commit so I can rebase you", exit 9
+#   - rebase conflict                  -> abort + route conflicting files as feedback, exit 9
 #   ./control/sync.sh <task> [<task> ...]   # rebase the named workers
 #   ./control/sync.sh --others <task>       # rebase every worker EXCEPT <task> (post-land)
 set -euo pipefail
@@ -25,29 +26,41 @@ rc_any=0
 for TASK in "${tasks[@]}"; do
   [ -f "$STATE_DIR/$TASK.env" ] || { echo "sync: unknown task '$TASK' (skipped)"; continue; }
   ( source "$STATE_DIR/$TASK.env"
-    container_running "$TASK" || { echo "sync: '$TASK' not running (skipped)"; exit 0; }
+    WT="${WORKTREE:-$(worktree_for "$TASK")}"
+    [ -e "$WT/.git" ] || { echo "sync: '$TASK' has no worktree (skipped)"; exit 0; }
+    HD="$(harness_dir "$TASK")"
 
-    # Refresh the exchange's base ref so the in-container fetch sees the just-landed commit.
-    git -C "$EXCHANGE" fetch -q "$CANONICAL" "refs/heads/$BASE_BRANCH:refs/heads/$BASE_BRANCH" 2>/dev/null || true
+    # Never rebase under a worker that is mid-burst — a moving worktree is how you corrupt work.
+    st="$(agent_state "$TASK")"
+    if [ "$st" = working ]; then
+      echo "sync: '$TASK' is busy (agent working) — deferred."
+      progress_log SYNC_DEFERRED "$TASK" "$BRANCH" "agent working; will retry on next land"
+      exit 0
+    fi
+    if ! git -C "$WT" diff --quiet 2>/dev/null || ! git -C "$WT" diff --cached --quiet 2>/dev/null; then
+      mkdir -p "$HD"
+      { echo "# Rebase pending onto $BASE_BRANCH — you have uncommitted changes."
+        echo "Commit them (or discard) so the supervisor can rebase your branch onto the new base."
+      } > "$HD/feedback.md"
+      echo "sync: '$TASK' has uncommitted changes — asked the worker to commit first."
+      progress_log SYNC_CONFLICT "$TASK" "$BRANCH" "dirty worktree; rebase deferred to worker"
+      exit 9
+    fi
 
-    inner='set -e; cd /work
-      git fetch -q origin
-      if git rebase "origin/'"$BASE_BRANCH"'"; then
-        git push -q --force-with-lease origin HEAD
-        echo "SYNC_OK"
-      else
-        files="$(git diff --name-only --diff-filter=U)"
-        git rebase --abort || true
-        mkdir -p /work/.harness
-        { echo "# Rebase conflict onto '"$BASE_BRANCH"' — resolve these, then commit (auto-pushes):";
-          echo "$files"; } > /work/.harness/feedback.md
-        echo "SYNC_CONFLICT"
-      fi'
-    out="$(docker exec "$CONTAINER" bash -lc "$inner" 2>&1 || true)"
-    if printf '%s' "$out" | grep -q SYNC_OK; then
-      echo "sync: '$TASK' rebased onto $BASE_BRANCH and pushed."
+    if git -C "$WT" rebase "$BASE_BRANCH" >/dev/null 2>&1; then
+      echo "sync: '$TASK' rebased onto $BASE_BRANCH."
       progress_log SYNCED "$TASK" "$BRANCH" "rebased onto $BASE_BRANCH"
+      agent_send "$TASK" "Your branch was rebased onto the new $BASE_BRANCH by the supervisor — run 'git status' before continuing." || true
     else
+      files="$(git -C "$WT" diff --name-only --diff-filter=U 2>/dev/null || true)"
+      git -C "$WT" rebase --abort 2>/dev/null || true
+      mkdir -p "$HD"
+      { echo "# Rebase conflict onto $BASE_BRANCH — resolve these, then commit:"
+        echo "$files"
+        echo
+        echo "You are NOT allowed to run 'git rebase' yourself; instead re-apply your intent on top"
+        echo "of the current files (the supervisor will rebase again), or ask the supervisor."
+      } > "$HD/feedback.md"
       echo "sync: '$TASK' has a rebase CONFLICT — routed to its feedback.md for the worker to resolve."
       progress_log SYNC_CONFLICT "$TASK" "$BRANCH" "rebase conflict onto $BASE_BRANCH"
       notify "$TASK rebase conflict — needs attention"

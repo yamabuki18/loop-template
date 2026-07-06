@@ -1,22 +1,25 @@
 # Supervisor — task allocation playbook (3 fixed workers: w1, w2, w3)
 
 You (with the human) own decomposition, assignment, **running the tests**, and integration.
-Workers never merge/rebase, and never run the test suite — they implement and fix only.
+Workers never merge/rebase/push, and never run the test suite — they implement and fix only.
 
 Roles:
-- **Supervisor (you + human):** 壁打ち / decompose & assign → workers return branches →
-  `verify.sh wN` runs the tests → on failure the result is routed back to the worker to fix
-  → on pass, `land.sh wN` merges.
-- **Worker:** implementation and fixes only. Reacts to `/work/.harness/feedback.md`.
+- **Supervisor (you + human):** 壁打ち / decompose & assign → workers commit on their branches
+  (instantly visible — worktrees share refs) → `verify.sh wN` runs the tests → on failure the
+  result is routed back to the worker to fix → on pass, `land.sh wN` merges.
+- **Worker:** implementation and fixes only. Reacts to `$HARNESS_DIR/feedback.md`.
+- **Second opinion (codex, optional):** independently reviews plans and gated diffs —
+  artifacts only. Advisory by default; treat its notes as a reviewer, not an oracle.
 
 The loop, concretely:
 1. Assign work (and ownership domain) to each worker.
-2. Worker implements, commits (auto-pushes).
-3. `./control/verify.sh wN` — supervisor runs the acceptance tests on the pushed branch.
-   - FAIL → failures are written to the worker as feedback; the worker fixes and re-pushes.
+2. Worker implements, commits (a commit IS publication in v3).
+3. `./control/verify.sh wN` — supervisor runs the acceptance tests on the committed branch.
+   - FAIL → failures are written to the worker as feedback; the worker fixes and re-commits.
      Re-run `verify.sh wN`.
-   - PASS → `./control/land.sh wN`.
-4. After landing, rebase the other live workers onto the new base.
+   - PASS → `./control/land.sh wN`.  (exit 7 = codex high-severity concerns routed as one
+     bounded feedback round — treat like a FAIL, the worker already has the notes.)
+4. After landing, rebase the other live workers onto the new base (`sync.sh --others wN`).
 
 ## Objective, in priority order
 1. **Zero merge conflicts.**
@@ -50,14 +53,14 @@ schema / migrations.
 - Keep a backlog in `board.md`. When a worker reports `...DONE` in its STATUS, assign the
   next task in its domain. If its domain is empty, give it a backlog item that does not
   overlap the other two.
-- After each land: `./control/land.sh wN`, then rebase the other live workers onto the new
-  base (land.sh prints the command), then re-check overlap.
+- After each land: `./control/land.sh wN`, then `./control/sync.sh --others wN`, then
+  re-check overlap.
 
 ## 6. Use the instruments every cycle
 - Before assigning new work AND before landing: run `./control/overlap.sh`.
   Any flagged file is an imminent conflict — resolve the partition (narrow a scope,
   reassign, or land one branch first and rebase the rest) before it bites.
-- `./control/status.sh` shows who is busy / idle / DONE.
+- `./control/status.sh` shows who is busy / idle / DONE (herdr agent states).
 
 ## 7. Landing order
 - Land the branch that touches shared / foundational files first, then rebase others.
@@ -65,11 +68,11 @@ schema / migrations.
 
 ## 8. The harness — absolute rules vs per-task instruction
 Rules split into two kinds. Keep them in the right layer:
-- **Absolute (harness, deterministic):** baked into the worker image as hooks, so they
-  fire on every tool call regardless of context — you never restate them.
-  - integration ops (merge/rebase/cherry-pick), protected-branch / force pushes → blocked
-  - edits outside the worker's ownership domain → blocked
-  - read isolation (container, no host mounts) and protected-branch push (pre-receive)
+- **Absolute (harness, deterministic):** wired into each worker's CLAUDE_CONFIG_DIR as hooks,
+  so they fire on every tool call regardless of context — you never restate them.
+  - integration ops (merge/rebase/cherry-pick), ALL pushes, ref/worktree/config surgery → blocked
+  - edits outside the worker's worktree or ownership domain → blocked
+  - secret access (age keys, ~/.ssh, ~/.claude, env dumps) → blocked (L2)
 - **Per-task (prompt, variable):** WHAT to build. This is the only thing you relay each time.
 
 Declare each worker's domain so the edit-guard can enforce the vertical-slice partition:
@@ -87,15 +90,16 @@ Promote based on violation frequency + how mechanically detectable it is. The ha
 itself needs upkeep — prune rules that no longer earn their keep.
 
 ## 10. The acceptance gate (ladder L3/L4) — supervisor runs the tests
-You run the tests, not the workers. `verify.sh` (and `land.sh`) spin up a CLEAN throwaway
-container, trial-merge the worker branch into the base, and run the project's checks on the
-result. Workers never execute the suite — they only receive failures and fix them.
+You run the tests, not the workers. `verify.sh` (and `land.sh`) lay out a CLEAN throwaway
+worktree, trial-merge the worker branch into the base, and run the project's checks on the
+result (gate-scope secrets injected only there). Workers never execute the suite — they only
+receive failures and fix them.
 - `./control/verify.sh wN` — the loop command. PASS → land it. FAIL → the failure log is
-  written to the worker (`/work/.harness/feedback.md`) and the worker is nudged to fix.
+  written to the worker (`$HARNESS_DIR/feedback.md`) and the worker is nudged to fix.
 - `./control/land.sh wN` — gated merge (re-runs the gate as a final guard). `--no-verify` to
   override (you are the trusted party; use sparingly).
 - Make checks real: commit `harness/check.sh` to the repo (template
-  `control/harness-check.sample.sh`) or set `CHECK_CMD` in `control/config.env`.
+  `control/harness-check.sample.sh`) or set `CHECK_CMD` in `config.env`.
 
 ## 11. Test strategy — thin contract-first, pipelined per slice
 You own and run the tests, but you do NOT write the whole suite up front (that would serialize
@@ -112,3 +116,10 @@ w2's contract and assign w2, etc. Parallelism starts at the FIRST contract, not 
 monolithic test-writing phase. The serial part is only "define this slice's contract" — the
 decomposition you do anyway. Workers can't lower the bar: they don't own the acceptance tests,
 and you run them.
+
+## 12. Reading the second opinion (codex)
+- Plan-time notes land inside each slice's brief — review them when you review the plan;
+  delete a note if you judge it wrong (you are the editor, codex is a reviewer).
+- Gate-time verdicts live in `state/gate/<w>.codex.json`; high-severity ones arrive as a
+  normal feedback round. If codex keeps flagging a false positive, tell the worker to refute
+  it with a code comment — the round budget (`CODEX_GATE_MAX_ROUNDS`) prevents a loop.

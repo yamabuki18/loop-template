@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# PreToolUse(Bash) — absolute rule, fires every time regardless of context.
-# Integration verbs (merge/rebase/cherry-pick) and protected-branch pushes are
-# reserved for the supervisor. Exit 2 blocks the tool; stderr is shown to Claude.
+# PreToolUse(Bash) — absolute rules, fire every time regardless of context.
+# v3 workers share canonical's object store and refs through a git worktree, so besides the
+# v2 integration verbs (merge/rebase/cherry-pick), everything that could mutate SHARED git
+# state — pushes (canonical's origin is the real project repo!), ref surgery, worktree
+# management, gc, repo config — is reserved for the supervisor.
+# Exit 2 blocks the tool; stderr is shown to Claude.
 input="$(cat)"
 cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)"
 [ -n "$cmd" ] || exit 0
@@ -9,7 +12,7 @@ cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)"
 deny() { echo "HARNESS: $1" >&2; exit 2; }
 
 if echo "$cmd" | grep -qE '\bgit[[:space:]]+(merge|rebase|cherry-pick)\b'; then
-  deny "merge/rebase/cherry-pick are supervisor-only. Push your work/ branch with: git push origin HEAD"
+  deny "merge/rebase/cherry-pick are supervisor-only. Commit on your branch; the supervisor integrates."
 fi
 # D6: `git pull` = fetch + merge, so it can create the merge commits we forbid above. Block it
 # (plain `git fetch` stays allowed — it never integrates).
@@ -19,12 +22,32 @@ fi
 if echo "$cmd" | grep -qE '\bgit[[:space:]]+reset[[:space:]]+--hard\b'; then
   deny "git reset --hard is blocked. Commit or stash instead."
 fi
-# D6: only treat a protected branch as the PUSH TARGET (refspec), not anywhere in the command,
-# so `git push origin work/main-page` is not mis-blocked by a bare \bmain\b match.
-if echo "$cmd" | grep -qE '\bgit[[:space:]]+push\b.*[[:space:]:](main|master|develop)([[:space:]]|$)'; then
-  deny "pushing to a protected branch is supervisor-only. Use: git push origin HEAD"
+# v3: ALL pushes are blocked. Your worktree shares refs with canonical — your commit is already
+# visible to the supervisor the moment you make it, and canonical's `origin` is the operator's
+# real project repo, which a worker must never write.
+if echo "$cmd" | grep -qE '\bgit[[:space:]]+push\b'; then
+  deny "git push is blocked in v3: your commits are instantly visible to the supervisor (shared worktree refs) and the remote is the operator's real repo. Just commit."
 fi
-if echo "$cmd" | grep -qE '\bgit[[:space:]]+push\b.*(--force|--force-with-lease|[[:space:]]-f\b)'; then
-  deny "force-push is blocked."
+# Shared-repo protection: worktree surgery, ref surgery, and history/object destruction would
+# affect EVERY worker (and canonical itself), not just this box.
+if echo "$cmd" | grep -qE '\bgit[[:space:]]+worktree\b'; then
+  deny "git worktree management is supervisor-only (your worktree is created/removed by the loop)."
+fi
+if echo "$cmd" | grep -qE '\bgit[[:space:]]+(update-ref|symbolic-ref)\b'; then
+  deny "direct ref surgery is blocked — refs are shared with canonical and the other workers."
+fi
+if echo "$cmd" | grep -qE '\bgit[[:space:]]+(gc|prune)\b|\bgit[[:space:]]+reflog[[:space:]]+expire\b'; then
+  deny "gc/prune/reflog-expire are blocked — the object store is shared; destroying loose objects could destroy other workers' commits."
+fi
+# `git branch` mutations against other branches: force-move/force-delete/rename can retarget a
+# shared branch (e.g. `git branch -f main X`). Reads and plain creation stay allowed.
+if echo "$cmd" | grep -qE '\bgit[[:space:]]+branch\b.*([[:space:]]-(f|D|M|m)\b|--force\b|--delete\b|--move\b)'; then
+  deny "force/delete/rename of branches is blocked — branches are shared with canonical. Work on your own work/ branch."
+fi
+# Repo config is SHARED across worktrees, and --global writes the HOST user's ~/.gitconfig.
+# Reads are fine; your identity comes from GIT_AUTHOR_*/GIT_COMMITTER_* env (set at spawn).
+if echo "$cmd" | grep -qE '\bgit[[:space:]]+config\b' \
+   && ! echo "$cmd" | grep -qE '\bgit[[:space:]]+config\b[^|;&]*(--get\b|--get-all\b|--get-regexp\b|--list\b|[[:space:]]-l\b)'; then
+  deny "git config writes are blocked (repo config is shared across worktrees; --global is the host user's). Your identity is preset via GIT_AUTHOR_*/GIT_COMMITTER_* env."
 fi
 exit 0

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Absorb the PROJECT's new commits into the loop (daily dev: you keep committing while the loop
-# works). Fast-forwards canonical's BASE_BRANCH from the project repo (canonical's origin) and
-# propagates the new base into every worker exchange. ff-only ON PURPOSE: if the histories
-# diverged, the loop has landed work the project hasn't merged yet — publish + merge first,
-# then refresh (never auto-merge two histories behind the supervisor's back).
+# works). Fast-forwards canonical's BASE_BRANCH from the project repo (canonical's origin);
+# workers see the new base instantly (shared worktree refs). ff-only ON PURPOSE: if the
+# histories diverged, the loop has landed work the project hasn't merged yet — publish + merge
+# first, then refresh (never auto-merge two histories behind the supervisor's back).
 #
 #   ./control/refresh.sh
 set -euo pipefail
@@ -30,16 +30,11 @@ if [ "$before" = "$after" ]; then
   exit 0
 fi
 
-# Propagate the new base into every worker exchange (same reasoning as land.sh D3), and
-# refresh the planner's map. Live workers still need a rebase — advise, don't surprise.
-shopt -s nullglob
-for f in "$STATE_DIR"/*.env; do
-  ( source "$f"
-    git -C "$EXCHANGE" fetch -q "$CANONICAL" "refs/heads/$BASE_BRANCH:refs/heads/$BASE_BRANCH" 2>/dev/null || true )
-done
+# Refresh the planner's map. Workers already see the new base ref (shared worktrees) —
+# live ones still need a rebase: advise, don't surprise.
 repo_map_refresh
 
-echo "refresh: $BASE_BRANCH $before -> $after (from project). Exchanges updated."
+echo "refresh: $BASE_BRANCH $before -> $after (from project)."
 tasks="$(worker_tasks | tr '\n' ' ')"
 [ -n "$tasks" ] && echo "next: rebase live workers onto the new base:  ./control/sync.sh $tasks"
 progress_log REFRESHED "-" "$BASE_BRANCH@$after" "from project ($before -> $after)"

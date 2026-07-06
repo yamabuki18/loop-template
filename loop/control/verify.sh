@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Supervisor loop command. The supervisor runs the tests; workers never do.
-#   - PASS -> tells you it's ready to land.
-#   - FAIL -> writes the failure log into the worker as /work/.harness/feedback.md and nudges
-#             the worker to fix. The worker fixes + commits (auto-pushes); you re-verify.
+#   - PASS  -> applies the codex second-opinion policy (advisory by default), then reports
+#              ready-to-land. High-severity codex concerns may consume a bounded feedback
+#              round (exit 7) instead — see codex_gate_policy in lib.sh.
+#   - FAIL  -> writes the failure log into the worker's feedback.md and nudges the worker.
 #   ./control/verify.sh <task>
 # NOTE: lib.sh runs `set -euo pipefail`, which RE-ENABLES -e here even though this script
 # opens with `set -uo pipefail`. So a bare failing pipeline (`gate | tee`) would abort the
@@ -14,12 +15,46 @@ source "$(dirname "$0")/lib.sh"
 TASK="${1:?usage: verify.sh <task>}"
 [ -f "$STATE_DIR/$TASK.env" ] || die "unknown task '$TASK'"
 source "$STATE_DIR/$TASK.env"
+HD="$(harness_dir "$TASK")"
+
+# Route text back to the worker: write feedback.md (out-of-tree state — a plain host file in
+# v3) and nudge its Claude. Delivery is guaranteed by the SessionStart/stop-gate hooks even
+# when the nudge is dropped.
+route_feedback() { # stdin -> feedback.md
+  mkdir -p "$HD"
+  cat > "$HD/feedback.md"
+}
+nudge() {
+  if agent_send "$TASK" "Read $HD/feedback.md — the supervisor's checks failed on your branch. Fix the issues, then commit."; then
+    echo "nudged worker '$TASK' in herdr."
+  fi
+}
 
 log="$(mktemp)"
 # -e-safe: capture the gate's real exit code without letting a non-zero pipeline abort us.
 if "$CONTROL_DIR/gate.sh" "$TASK" 2>&1 | tee "$log"; then rc=0; else rc=${PIPESTATUS[0]}; fi
 
 if [ "$rc" -eq 0 ]; then
+  # Deterministic gate PASSED. Apply the second-opinion policy: rc 0 = pass (advisory notes,
+  # if any, went to PROGRESS), rc 7 = route the codex concerns as a bounded feedback round.
+  verdict="$STATE_DIR/gate/$TASK.codex.json"
+  fb="$(mktemp)"
+  if codex_gate_policy "$verdict" "$TASK" > "$fb"; then crc=0; else crc=$?; fi
+  if [ "$crc" -eq 7 ]; then
+    {
+      echo "# Supervisor feedback — $TASK ($BRANCH)"
+      echo "# The deterministic checks PASSED, but the independent second-opinion review found"
+      echo "# high-severity concerns. Address them (or refute them in code comments), then commit."
+      echo
+      cat "$fb"
+    } | route_feedback \
+      && echo "VERIFY: second opinion routed high-severity concerns to $HD/feedback.md" \
+      || echo "VERIFY: could not write feedback for '$TASK'."
+    nudge
+    rm -f "$log" "$fb"
+    exit 7
+  fi
+  rm -f "$fb"
   echo
   echo "VERIFY PASS: $TASK ready. Land it with:  ./control/land.sh $TASK"
   rm -f "$log"
@@ -29,9 +64,9 @@ fi
 # Route the failure back to the worker (workers don't run tests; they only get results).
 {
   echo "# Supervisor test feedback — $TASK ($BRANCH)"
-  echo "# The supervisor ran the acceptance tests on your PUSHED branch and they FAILED (exit $rc)."
-  echo "# Fix the issues below, then commit (commits auto-push). The supervisor will re-verify."
-  echo "# This file is transient (gitignored); you may delete it once addressed."
+  echo "# The supervisor ran the acceptance tests on your COMMITTED branch and they FAILED (exit $rc)."
+  echo "# Fix the issues below, then commit. The supervisor will re-verify."
+  echo "# This file is transient (out-of-tree); you may delete it once addressed."
   echo
   # Distill long gate logs (FEEDBACK_MAX_LINES): a full `npm ci` transcript buries the actual
   # failure and pollutes the worker's context. Keep the head (what the gate ran) and the tail
@@ -47,20 +82,11 @@ fi
     echo
     tail -n "$keep_tail" "$log"
   fi
-} | docker exec -i "$CONTAINER" bash -lc 'mkdir -p /work/.harness && cat > /work/.harness/feedback.md' 2>/dev/null \
-  && echo "VERIFY FAIL (exit $rc): wrote failures to $TASK:/work/.harness/feedback.md" \
-  || echo "VERIFY FAIL (exit $rc): could not reach container '$TASK' (running?)."
+} | route_feedback \
+  && echo "VERIFY FAIL (exit $rc): wrote failures to $HD/feedback.md" \
+  || echo "VERIFY FAIL (exit $rc): could not write feedback for '$TASK'."
 
-# Best-effort: nudge the worker's Claude in its tmux pane (fleet) / window (legacy).
-if pane="$(worker_pane "$TASK")"; then
-  # Send text and the submitting Enter as SEPARATE send-keys calls (a combined call races the TUI
-  # and leaves the nudge typed-but-unsubmitted, so the worker never re-engages on feedback). Same
-  # fix as assign.sh.
-  tmux send-keys -t "$pane" "Read /work/.harness/feedback.md — the supervisor's tests failed on your branch. Fix the issues, then commit (it auto-pushes)."
-  sleep 1
-  tmux send-keys -t "$pane" Enter
-  echo "nudged worker '$TASK' in tmux."
-fi
+nudge
 
 rm -f "$log"
 exit "$rc"

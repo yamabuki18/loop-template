@@ -1,38 +1,40 @@
 #!/usr/bin/env bash
 # THE LOOP (full autonomy) — the deterministic, host-side heartbeat that runs the
 # DISCOVER -> PLAN -> EXECUTE -> VERIFY -> ITERATE cycle with no human in the inner loop.
-# It is plain bash on purpose: no Claude runs on the host, so there is nothing to prompt for
-# permission (goal #1) and nothing that can read host credentials (goal #3). All intelligence
-# lives in isolated containers (planner + workers).
+# It is plain bash on purpose: no LLM runs in the loop process itself, so there is nothing to
+# prompt for permission (goal #1) and no secret ever enters an LLM-readable process except the
+# one credential each role needs (goal #3, via secret_exec).
 #
 # One goal at a time (keeps slice ownership clean):
 #   DISCOVER/PLAN : take the next "- [ ]" goal from memory/backlog.md -> plan.sh -> slices + tests
+#                   (+ optional codex plan critique — independent second opinion)
 #   ASSIGN        : hand disjoint slices to free workers (assign.sh; delivered via SessionStart hook)
-#   EXECUTE       : worker Claude implements, commits -> autopush -> exchange push-event marker
-#   VERIFY        : on a push, run the gate (verify.sh). PASS -> land + sync others. FAIL -> feedback.
+#   EXECUTE       : worker Claude implements in its worktree, commits -> ref instantly visible
+#   VERIFY        : on a new commit + idle agent, run the gate (verify.sh). PASS -> land + sync
+#                   others. FAIL (or codex high-severity concerns) -> feedback round.
 #   ITERATE       : worker's stop-gate re-engages on feedback; after MAX_FEEDBACK_ROUNDS -> escalate.
 # Completion: backlog has no "- [ ]" goals and no worker is busy -> notify + exit.
 #
-# Run it in a tmux pane (up.sh offers to). Stop with Ctrl-C; re-run any time (idempotent).
+# Run it in the 'loop' herdr pane (up.sh pre-types it). Stop with Ctrl-C; re-run any time.
 #   ./control/loop.sh
 set -uo pipefail
 source "$(dirname "$0")/lib.sh"
 
 [ -d "$CANONICAL/.git" ] || die "canonical not found — run ./control/setup.sh first."
-have_credential || die "no credential ($CONFIG_DIR/secret.env): set CLAUDE_CODE_OAUTH_TOKEN (subscription) or ANTHROPIC_API_KEY (metered API)."
+have_credential || die "no credential: run 'claude setup-token' then 'loop secrets edit worker' (or log in to claude on this host)."
 echo "loop: auth $(auth_mode) mode"
 mkdir -p "$LOG_DIR"
 
-# Ensure the worker pool is online (idempotent). up.sh also attaches tmux; here we only need them up.
+# Ensure the worker pool is online (idempotent). up.sh also attaches herdr; here we only need them up.
 mapfile -t WORKERS < <(worker_tasks)
 if [ "${#WORKERS[@]}" -eq 0 ]; then
-  echo "loop: no workers yet — bringing up $WORKER_COUNT (run ./control/up.sh for the tmux view)."
+  echo "loop: no workers yet — bringing up $WORKER_COUNT (run ./control/up.sh for the herdr view)."
   for i in $(seq 1 "$WORKER_COUNT"); do "$CONTROL_DIR/spawn.sh" "w$i" >/dev/null; done
   mapfile -t WORKERS < <(worker_tasks)
 fi
 
-declare -A SEEN BUSY ROUNDS SLICE
-for w in "${WORKERS[@]}"; do SEEN["$w"]="$(marker_mtime "$w")"; BUSY["$w"]=0; ROUNDS["$w"]=0; SLICE["$w"]=""; done
+declare -A SEEN BUSY ROUNDS SLICE UNK
+for w in "${WORKERS[@]}"; do SEEN["$w"]="$(worker_head "$w")"; BUSY["$w"]=0; ROUNDS["$w"]=0; SLICE["$w"]=""; UNK["$w"]=0; done
 
 QUEUE=()                 # pending slices (compact JSON) for the ACTIVE goal
 ACTIVE_GOAL=""
@@ -116,22 +118,35 @@ while true; do
     [ -n "$wiki_page" ] && brief="$brief"$'\n\n'"Also update $wiki_page — your module wiki page — to reflect what you built (role, public interface, data shapes, dependencies). It is part of DONE."
     echo "loop: assign $w <- slice '$name' (paths: ${paths[*]})"
     "$CONTROL_DIR/assign.sh" "$w" --brief "$brief"$'\n\n'"(slice: $name)" "${paths[@]}" >/dev/null 2>&1 || true
-    BUSY["$w"]=1; SLICE["$w"]="$name"; ROUNDS["$w"]=0; SEEN["$w"]="$(marker_mtime "$w")"
+    BUSY["$w"]=1; SLICE["$w"]="$name"; ROUNDS["$w"]=0; UNK["$w"]=0; SEEN["$w"]="$(worker_head "$w")"
     progress_log ASSIGNED "$w" "-" "$name"
   done
 
-  # ── VERIFY/ITERATE: react to worker pushes ──
+  # ── VERIFY/ITERATE: react to new worker commits (shared refs replace the v2 push marker) ──
   for w in "${WORKERS[@]}"; do
     [ "${BUSY[$w]}" = 1 ] || continue
-    m="$(marker_mtime "$w")"
-    [ "$m" != "${SEEN[$w]}" ] && [ "$m" != 0 ] || continue
-    SEEN["$w"]="$m"
-    echo "loop: push on $w (slice ${SLICE[$w]}) — gating."
+    h="$(worker_head "$w")"
+    [ "$h" != "${SEEN[$w]}" ] && [ "$h" != none ] || continue
+    # Gate only when the worker's burst is over: herdr says idle/blocked/done. 'working' means
+    # more commits are likely coming — wait. unknown/none (no herdr, crashed pane) must not
+    # strand committed work: force the gate after AGENT_UNKNOWN_GRACE cycles.
+    st="$(agent_state "$w")"
+    case "$st" in
+      working)
+        UNK["$w"]=0; continue ;;
+      idle|blocked|done)
+        UNK["$w"]=0 ;;
+      *)
+        UNK["$w"]=$(( UNK["$w"] + 1 ))
+        if [ "${UNK[$w]}" -lt "${AGENT_UNKNOWN_GRACE:-6}" ]; then continue; fi
+        echo "loop: $w agent state '$st' for ${UNK[$w]} cycles — gating anyway." ;;
+    esac
+    SEEN["$w"]="$h"; UNK["$w"]=0
+    echo "loop: new commits on $w (slice ${SLICE[$w]}) — gating."
     if "$CONTROL_DIR/verify.sh" "$w" >>"$LOG_DIR/$w.gate.log" 2>&1; then
-      sha="$(git -C "$EXCHANGE_DIR/$w.git" rev-parse --short "work/$w" 2>/dev/null || echo '?')"
-      # verify.sh just ran the gate on this exact pushed branch and it PASSED, so land with
-      # --no-verify to avoid a second (redundant) Docker gate run. Re-gating here would double
-      # the per-land container cost in a loop that may land many slices.
+      sha="$(git -C "$CANONICAL" rev-parse --short "$(branch_for "$w")" 2>/dev/null || echo '?')"
+      # verify.sh just ran the gate on this exact branch and it PASSED (including the codex
+      # policy), so land with --no-verify to avoid a second (redundant) gate run.
       "$CONTROL_DIR/land.sh" "$w" --no-verify >>"$LOG_DIR/$w.land.log" 2>&1 \
         && { echo "loop: LANDED $w (${SLICE[$w]})"; progress_log LANDED "$w" "work/$w@$sha" "${SLICE[$w]}"; notify "landed: ${SLICE[$w]}"; } \
         || { echo "loop: land FAILED for $w despite gate pass — see $LOG_DIR/$w.land.log"; progress_log LAND_FAIL "$w" "-" "${SLICE[$w]}"; }

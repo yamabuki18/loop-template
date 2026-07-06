@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Show all workers, their branch, run state, and last STATUS line.
+# Show all workers, their branch, agent state, and last STATUS line.
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
@@ -8,12 +8,8 @@ shopt -s nullglob
 for f in "$STATE_DIR"/*.env; do
   (
     source "$f"
-    if container_running "$TASK"; then
-      state=running
-      st="$(docker exec "$CONTAINER" bash -lc 'tail -1 /work/STATUS 2>/dev/null' 2>/dev/null || true)"
-    else
-      state=stopped; st=""
-    fi
+    state="$(agent_state "$TASK")"
+    st="$(tail -1 "$(harness_dir "$TASK")/STATUS" 2>/dev/null || true)"
     printf "%-8s %-16s %-9s %s\n" "$TASK" "$BRANCH" "$state" "${st:--}"
   )
 done

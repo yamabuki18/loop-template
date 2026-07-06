@@ -1,43 +1,59 @@
 #!/usr/bin/env bash
-# The everyday command. Idempotent & resumable: brings the supervisor window plus
-# WORKER_COUNT workers online, then attaches you to tmux. Run it as often as you like.
+# The everyday command. Idempotent & resumable: brings the herdr workspace (supervisor panes +
+# WORKER_COUNT workers) online, then attaches you to herdr. Run it as often as you like.
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
 # Lightweight preflight (full check: ./control/doctor.sh).
 [ -x "$CONTROL_DIR/doctor.sh" ] && "$CONTROL_DIR/doctor.sh" --quick || true
 [ -d "$CANONICAL/.git" ] || die "canonical not found. Run setup.sh first ($CONTROL_DIR/setup.sh)."
-docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "image missing — building ..."; docker build --build-arg HOST_UID="$(id -u)" -t "$IMAGE" "$CONTROL_DIR"; }
+command -v herdr >/dev/null 2>&1 || die "herdr not found — install it: curl -fsSL https://herdr.dev/install.sh | sh"
 have_credential \
   && echo "auth: $(auth_mode) mode" \
-  || echo "WARNING: no credential set — workers can't run Claude. Set CLAUDE_CODE_OAUTH_TOKEN (subscription) or ANTHROPIC_API_KEY (metered API) in $CONFIG_DIR/secret.env."
+  || echo "WARNING: no credential — workers can't run Claude. Run: claude setup-token, then: loop secrets edit worker"
 
-# Supervisor window. Top pane = canonical shell. Bottom pane = the autonomous loop, pre-typed
-# (NOT auto-run): review the backlog, then press Enter to start ./control/loop.sh. For semi-auto
-# instead, run ./control/watch.sh there.
-if ! tmux has-session -t "$SESSION" 2>/dev/null; then
-  tmux new-session -d -s "$SESSION" -n supervisor -c "$CANONICAL"
-  # Panes/windows in this session inherit the resolved project, so every script run inside tmux
-  # binds to THIS workspace even when the engine is centrally installed.
-  tmux set-environment -t "$SESSION" LOOP_PROJECT "$ROOT"
-  tmux send-keys -t "$SESSION:supervisor" \
-    "clear; echo 'SUPERVISOR — canonical repo.'; echo 'goals: edit $MEMORY_DIR/backlog.md   progress: $MEMORY_DIR/PROGRESS.md'; echo 'workers: ALL live in the fleet window (next window) — Ctrl-b z zooms a pane in/out.'; echo 'full auto: loop.sh   semi-auto: watch.sh   status: status.sh   (in $CONTROL_DIR)'" C-m
-  tmux split-window -v -t "$SESSION:supervisor" -c "$ROOT"
-  tmux send-keys -t "$SESSION:supervisor.1" \
-    "clear; echo 'LOOP pane — edit memory/backlog.md first, then press Enter to launch loop.sh:'" C-m
-  # Pre-type the launch command WITHOUT Enter, so the human reviews the backlog then starts it.
-  tmux send-keys -t "$SESSION:supervisor.1" "$CONTROL_DIR/loop.sh"
-  # Dashboard pane (right of the loop pane): fleet-wide live status — backlog counters, every
-  # worker's run state / last push / STATUS / live pane tail, recent PROGRESS events. Read-only.
-  tmux split-window -h -t "$SESSION:supervisor.1" -c "$ROOT" "$CONTROL_DIR/dashboard.sh"
-  tmux select-pane -t "$SESSION:supervisor.0"
+mkdir -p "$STATE_DIR"
+
+# herdr server (persistent, shared across projects — down.sh never stops it).
+if ! herdr_ok; then
+  echo "up: starting herdr server ..."
+  ( herdr server >/dev/null 2>&1 & )
+  for _ in $(seq 1 20); do herdr_ok && break; sleep 0.5; done
+  herdr_ok || die "herdr server did not come up (try running 'herdr' once interactively)."
 fi
 
-# Bring up the default pool of workers (idempotent)
+# One herdr workspace per project. The id is persisted so spawn.sh/agents land in it; the
+# create-output format is not contract, so parse defensively and fall back to the list.
+ws="$(herdr_workspace)"
+if [ -z "$ws" ] || ! herdr workspace list 2>/dev/null | grep -q "$ws"; then
+  out="$(herdr workspace create --cwd "$CANONICAL" --label "$PROJECT_NAME" 2>/dev/null || true)"
+  ws="$(printf '%s\n' "$out" | grep -oE '\bw[A-Za-z0-9_-]{1,32}\b' | head -1)"
+  if [ -z "$ws" ]; then
+    ws="$(herdr workspace list 2>/dev/null | grep -F "$PROJECT_NAME" | grep -oE '\bw[A-Za-z0-9_-]{1,32}\b' | head -1)"
+  fi
+  if [ -n "$ws" ]; then echo "$ws" > "$STATE_DIR/herdr-workspace"; else
+    echo "up: WARNING — could not determine the workspace id; panes will open in the focused workspace."
+  fi
+fi
+
+# Supervisor panes. 'loop' = a shell with loop.sh PRE-TYPED (not run): review the backlog,
+# then press Enter. 'dashboard' = the read-only fleet dashboard. Idempotent by agent name.
+if ! herdr agent get dashboard >/dev/null 2>&1; then
+  herdr agent start dashboard ${ws:+--workspace "$ws"} --cwd "$ROOT" --no-focus \
+    --env "LOOP_PROJECT=$ROOT" -- bash "$CONTROL_DIR/dashboard.sh" >/dev/null 2>&1 || true
+fi
+if ! herdr agent get loop >/dev/null 2>&1; then
+  herdr agent start loop ${ws:+--workspace "$ws"} --cwd "$ROOT" --no-focus \
+    --env "LOOP_PROJECT=$ROOT" -- bash >/dev/null 2>&1 || true
+  sleep 1
+  # Pre-type the launch command WITHOUT Enter, so the human reviews the backlog then starts it.
+  herdr agent send loop "$CONTROL_DIR/loop.sh" 2>/dev/null || true
+fi
+
+# Bring up the default pool of workers (idempotent).
 for i in $(seq 1 "$WORKER_COUNT"); do
   "$CONTROL_DIR/spawn.sh" "w$i" >/dev/null
 done
 
-echo "attaching to tmux session '$SESSION' (detach: Ctrl-b then d)"
-tmux select-window -t "$SESSION:supervisor"
-exec tmux attach -t "$SESSION"
+echo "attaching to herdr (workspace '${ws:-?}' / $PROJECT_NAME). goals: $MEMORY_DIR/backlog.md"
+exec herdr

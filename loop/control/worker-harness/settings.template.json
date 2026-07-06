@@ -1,0 +1,32 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "__CONTROL_DIR__/worker-harness/harness-session-start" }] }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "__CONTROL_DIR__/worker-harness/harness-guard-git" },
+          { "type": "command", "command": "__CONTROL_DIR__/worker-harness/harness-guard-secrets" }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          { "type": "command", "command": "__CONTROL_DIR__/worker-harness/harness-guard-paths" },
+          { "type": "command", "command": "__CONTROL_DIR__/worker-harness/harness-guard-secrets" }
+        ]
+      },
+      {
+        "matcher": "Read|Grep|Glob",
+        "hooks": [
+          { "type": "command", "command": "__CONTROL_DIR__/worker-harness/harness-guard-secrets" }
+        ]
+      }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "__CONTROL_DIR__/worker-harness/harness-stop-gate" }] }
+    ]
+  }
+}

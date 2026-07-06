@@ -18,7 +18,7 @@ for m in "$LOOP_HOME"/workspaces/*/.loop-workspace; do
   todo="$(grep -c '^- \[ \] '  "$ws/memory/backlog.md" 2>/dev/null)";  todo="${todo:-0}"
   doing="$(grep -c '^- \[~\] ' "$ws/memory/backlog.md" 2>/dev/null)"; doing="${doing:-0}"
   done_="$(grep -c '^- \[x\] ' "$ws/memory/backlog.md" 2>/dev/null)"; done_="${done_:-0}"
-  running="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c "^cw-${name}-")"
+  running="$(ls -d "$ws"/worktrees/*/ 2>/dev/null | wc -l | tr -d ' ')"
   printf '%-16s %-6s %-14s %s\n' "$name" "$running" "$todo/$doing/$done_" "${proj:-$ws}"
 done
 [ "$found" = 1 ] || echo "(no central workspaces yet — attach one with:  cd <project> && loop here)"
