@@ -22,14 +22,16 @@ if ! herdr_ok; then
   herdr_ok || die "herdr server did not come up (try running 'herdr' once interactively)."
 fi
 
-# One herdr workspace per project. The id is persisted so spawn.sh/agents land in it; the
-# create-output format is not contract, so parse defensively and fall back to the list.
+# One herdr workspace per project. The id is persisted so spawn.sh/agents land in it. The CLI
+# answers in JSON (verified against herdr 0.7.1) — jq first, existing-by-label as fallback.
 ws="$(herdr_workspace)"
-if [ -z "$ws" ] || ! herdr workspace list 2>/dev/null | grep -q "$ws"; then
-  out="$(herdr workspace create --cwd "$CANONICAL" --label "$PROJECT_NAME" 2>/dev/null || true)"
-  ws="$(printf '%s\n' "$out" | grep -oE '\bw[A-Za-z0-9_-]{1,32}\b' | head -1)"
+if [ -z "$ws" ] || ! herdr workspace list 2>/dev/null | grep -q "\"$ws\""; then
+  if out="$(herdr workspace create --cwd "$CANONICAL" --label "$PROJECT_NAME" 2>/dev/null)"; then
+    ws="$(printf '%s' "$out" | jq -r '.result.workspace.workspace_id // empty' 2>/dev/null)"
+  else ws=""; fi
   if [ -z "$ws" ]; then
-    ws="$(herdr workspace list 2>/dev/null | grep -F "$PROJECT_NAME" | grep -oE '\bw[A-Za-z0-9_-]{1,32}\b' | head -1)"
+    ws="$(herdr workspace list 2>/dev/null \
+          | jq -r --arg l "$PROJECT_NAME" '.result.workspaces[]? | select(.label==$l) | .workspace_id' 2>/dev/null | head -1)"
   fi
   if [ -n "$ws" ]; then echo "$ws" > "$STATE_DIR/herdr-workspace"; else
     echo "up: WARNING — could not determine the workspace id; panes will open in the focused workspace."
