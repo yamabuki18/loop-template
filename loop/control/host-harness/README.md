@@ -14,6 +14,12 @@ blocks the obvious leaks:
 - `env` / `printenv` dumps that mention `ANTHROPIC` / `API_KEY` / `OAUTH` / `secret`
 - any reference to credential variable names
 
+The settings also wire `harness-plan-capture` (PostToolUse on ExitPlanMode): every plan you
+approve in plan mode is persisted to the workspace's `memory/plans/latest.md`, and the session
+is steered to hand implementation to the fleet (`loop handoff "<title>" --latest`) instead of
+implementing inline. Best-effort and workspace-scoped: with no loop workspace resolvable it
+does nothing.
+
 ## Install
 
 Merge `host-harness/settings.json`'s `hooks` block into your project `.claude/settings.json`

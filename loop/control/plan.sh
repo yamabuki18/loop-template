@@ -61,6 +61,11 @@ independent vertical slices that separate worker agents will implement in parall
 GOAL TO DECOMPOSE:
 $GOAL
 
+If the goal text references a plan file, e.g. "(plan: memory/plans/<file>)", that plan was
+ALREADY designed and approved by a human in an interactive session. Read $MEMORY_DIR/plans/<file>
+FIRST and decompose THAT plan faithfully into slices — do not re-plan, second-guess its
+approach, or widen its scope; your job is only the slicing and the contract tests.
+
 Read these first:
 - $SKILLS_DIR/VISION.md, $SKILLS_DIR/ARCHITECTURE.md, $SKILLS_DIR/RULES.md  (project intent, structure, rules)
 - $MEMORY_DIR/REPO_MAP.md  (auto-generated directory map with file counts — trust it and only

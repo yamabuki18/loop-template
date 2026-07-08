@@ -100,6 +100,12 @@ cat > "$SCD/settings.json" <<EOF
         "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [{ "type": "command", "command": "$CONTROL_DIR/host-harness/harness-guard-secrets" }]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [{ "type": "command", "command": "$CONTROL_DIR/host-harness/harness-plan-capture" }]
+      }
     ]
   }
 }

@@ -284,6 +284,49 @@ jq -e '.hooks.PreToolUse[0].hooks[0].command | endswith("host-harness/harness-gu
   && ok "supervise: host-harness secrets guard wired by absolute path" \
   || ko "supervise: secrets guard missing from supervisor settings"
 
+echo "== plan-mode handoff (plan capture hook + handoff.sh) =="
+PLANCAP="$CTL/host-harness/harness-plan-capture"
+PLAN_JSON='{"tool_name":"ExitPlanMode","tool_input":{"plan":"# Auth Plan\n1. add login\n2. add tests"}}'
+out="$( printf '%s' "$PLAN_JSON" | LOOP_PROJECT="$sx/ws" HOME="$sx/home" bash "$PLANCAP" 2>/dev/null )"
+if grep -q 'add login' "$sx/ws/memory/plans/latest.md" 2>/dev/null; then
+  ok "plan-capture: approved plan persisted to memory/plans/latest.md"
+else ko "plan-capture: latest.md missing or wrong"; fi
+printf '%s' "$out" | jq -e '.hookSpecificOutput.additionalContext | test("handoff.sh")' >/dev/null 2>&1 \
+  && ok "plan-capture: steers the session to handoff (additionalContext)" \
+  || ko "plan-capture: no handoff instruction in output"
+out="$( printf '{"tool_name":"ExitPlanMode","tool_input":{}}' | LOOP_PROJECT="$sx/ws" HOME="$sx/home" bash "$PLANCAP" 2>/dev/null )"
+[ -z "$out" ] && ok "plan-capture: silent without a plan payload" || ko "plan-capture: emitted without plan"
+# Legacy-fallback protection: from a foreign cwd with NO workspace, the hook must do nothing —
+# especially not write into the ENGINE's own memory/ (lib.sh would resolve there as fallback).
+out="$( cd /tmp && printf '%s' "$PLAN_JSON" | env -u LOOP_PROJECT HOME="$sx/home" bash "$PLANCAP" 2>/dev/null )"
+if [ -z "$out" ] && [ ! -e "$CTL/../memory/plans/latest.md" ]; then
+  ok "plan-capture: refuses legacy-fallback resolution (engine memory untouched)"
+else ko "plan-capture: acted outside a genuine workspace"; fi
+# handoff.sh: archive + backlog entry from the captured plan.
+if ( export LOOP_PROJECT="$sx/ws" HOME="$sx/home"
+     bash "$CTL/handoff.sh" "Add User Auth" --latest ) >/dev/null 2>&1; then
+  ok "handoff.sh runs on the captured plan"
+else ko "handoff.sh failed"; fi
+grep -qE '^- \[ \] Add User Auth \(plan: memory/plans/[0-9TZ]+-add-user-auth\.md\)$' "$sx/ws/memory/backlog.md" 2>/dev/null \
+  && ok "handoff: backlog goal references the archived plan" \
+  || ko "handoff: backlog entry missing/wrong ($(tail -1 "$sx/ws/memory/backlog.md" 2>/dev/null))"
+arch="$(ls "$sx/ws/memory/plans/"*-add-user-auth.md 2>/dev/null | head -1)"
+[ -n "$arch" ] && grep -q 'add login' "$arch" \
+  && ok "handoff: plan archived verbatim" || ko "handoff: archive missing or wrong"
+grep -q $'\tHANDOFF\t' "$sx/ws/memory/PROGRESS.md" 2>/dev/null \
+  && ok "handoff: HANDOFF event logged to PROGRESS" || ko "handoff: PROGRESS event missing"
+printf 'stdin plan body\n' | ( export LOOP_PROJECT="$sx/ws" HOME="$sx/home"
+  bash "$CTL/handoff.sh" "From Stdin" --plan - ) >/dev/null 2>&1
+arch2="$(ls "$sx/ws/memory/plans/"*-from-stdin.md 2>/dev/null | head -1)"
+[ -n "$arch2" ] && grep -q 'stdin plan body' "$arch2" \
+  && ok "handoff: --plan - reads the plan from stdin" || ko "handoff: stdin variant failed"
+grep -q 'decompose THAT plan faithfully' "$CTL/plan.sh" \
+  && ok "plan.sh: planner instructed to honor referenced plans (no re-planning)" \
+  || ko "plan.sh: handoff instruction missing from the planner prompt"
+jq -e '.hooks.PostToolUse[] | select(.matcher=="ExitPlanMode")' "$svd/settings.json" >/dev/null 2>&1 \
+  && ok "supervise: plan-capture wired on ExitPlanMode" \
+  || ko "supervise: plan-capture hook missing from supervisor settings"
+
 echo "== heartbeat exclusivity (loop.sh vs watch.sh) =="
 mkdir -p "$sx/ws/state"
 echo $$ > "$sx/ws/state/loop.pid"   # this test process is alive -> watch must refuse

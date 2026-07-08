@@ -17,6 +17,8 @@ loop/
     supervise.sh      対話監督モード（= loop supervise）: watch ペイン + SUPERVISOR_MODEL の
                       対話 Claude（CLAUDE.supervisor.md + 生成環境情報を CLAUDE.md に注入）
     plan.sh           ヘッドレス計画役 Claude（使い捨て worktree）を回し slices.json を得る
+    handoff.sh        plan mode 承認済み計画 → backlog ゴール化（host-harness/harness-plan-capture
+                      が ExitPlanMode で計画を memory/plans/latest.md へ捕捉する）
     gate.sh           受け入れゲート（使い捨て detached worktree で試しマージ+チェック）
     second-opinion.sh codex 独立レビュアー（純評価器。policy は呼び出し側と lib.sh）
     secrets.sh        sops+age の秘密管理（init/edit/status/migrate）

@@ -117,7 +117,20 @@ monolithic test-writing phase. The serial part is only "define this slice's cont
 decomposition you do anyway. Workers can't lower the bar: they don't own the acceptance tests,
 and you run them.
 
-## 12. Reading the second opinion (codex)
+## 12. Plan mode → hand off to the fleet (never implement here)
+When you design in plan mode and the human approves the plan, do NOT drop into auto-edit
+mode and implement it yourself — you are the supervisor; implementation belongs to the
+workers, under the gate. On approval a hook captures the plan to `memory/plans/latest.md`
+and reminds you. Then:
+```
+./control/handoff.sh "<short goal title>" --latest
+```
+This archives the plan and queues it as a backlog goal; the headless planner decomposes THAT
+plan faithfully into slices + contract tests (it is instructed not to re-plan). If you want
+to slice it yourself instead, skip handoff and go straight to contract tests + `assign.sh`
+(section 11) — but the work still runs on workers, never in this session.
+
+## 13. Reading the second opinion (codex)
 - Plan-time notes land inside each slice's brief — review them when you review the plan;
   delete a note if you judge it wrong (you are the editor, codex is a reviewer).
 - Gate-time verdicts live in `state/gate/<w>.codex.json`; high-severity ones arrive as a
