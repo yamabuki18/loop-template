@@ -74,6 +74,16 @@ gg "allow branch list"       0 "git branch"
 gg "allow fetch"             0 "git fetch origin"
 gg "allow commit"            0 "git commit -m 'done'"
 gg "allow normal build"      0 "npm test"
+# global-option / env-prefix evasions of the plain `git <verb>` form (D12 speed-bump).
+gg "block push via git -C"       2 "git -C /path/to/repo push origin main"
+gg "block push via -c cfg"       2 "git -c protocol.version=2 push origin HEAD"
+gg "block push via --git-dir"    2 "git --git-dir=/r/.git push origin main"
+gg "block push via GIT_DIR env"  2 "GIT_DIR=/r/.git git push origin main"
+gg "block merge via git -C"      2 "git -C . merge origin/main"
+gg "block config write via -C"   2 "git -C /r config user.name evil"
+gg "allow git -C status"         0 "git -C /r status"
+gg "allow git -c pager log"      0 "git -c core.pager=cat log --oneline"
+gg "allow config read via -C"    0 "git -C /r config --get user.name"
 
 echo "== guard-paths =="
 gpws="$(mktemp -d)"; mkdir -p "$gpws/wt" "$gpws/hd"
@@ -175,12 +185,36 @@ case $? in
   24) ko "structural: worker could check out the base branch";;
   *) ko "worktree structural test: unexpected error";;
 esac
+
+echo "== lib: slice_stats (per-slice telemetry) =="
+tmp="$(mktemp -d)"
+out="$( set -e
+  export LOOP_PROJECT="$tmp"
+  mkdir -p "$tmp/canonical"
+  git -C "$tmp/canonical" init -q -b main
+  git -C "$tmp/canonical" -c user.email=a@b -c user.name=a commit -q --allow-empty -m init
+  source "$CTL/lib.sh"
+  git -C "$CANONICAL" worktree add -b work/w1 "$tmp/wt" main >/dev/null 2>&1
+  printf 'a\nb\nc\n' > "$tmp/wt/f.txt"
+  git -C "$tmp/wt" -c user.email=w@l -c user.name=w add -A
+  git -C "$tmp/wt" -c user.email=w@l -c user.name=w commit -q -m c1
+  slice_stats w1
+)"
+printf '%s' "$out" | grep -qE 'commits=1 \+3 -0 files=1' \
+  && ok "slice_stats reports commits/+ins/-del/files ($out)" \
+  || ko "slice_stats: wrong output ($out)"
+out2="$( export LOOP_PROJECT="$tmp"; source "$CTL/lib.sh"; slice_stats nope )"
+[ "$out2" = "commits=0" ] && ok "slice_stats: no branch -> commits=0" || ko "slice_stats: nope gave '$out2'"
+rm -rf "$tmp"
 rm -rf "$tmp"
 
 echo "== stop-gate feedback delivery (A2) =="
 tmp="$(mktemp -d)"; ( set -e; cd "$tmp"
   git init -q -b main; git config user.email a@b; git config user.name a
-  mkdir -p .harness; echo x>f; git add -A; git commit -qm c1
+  # .harness/ is worker state, never committed (production keeps it OUT of the worktree
+  # entirely); gitignore it so the porcelain-based clean check doesn't treat feedback.md as
+  # uncommitted work.
+  mkdir -p .harness; echo x>f; printf '.harness/\n' > .gitignore; git add -A; git commit -qm c1
 )
 export HARNESS_WORKDIR="$tmp"
 # feedback newer than last commit -> must force continue (exit 2)
@@ -191,6 +225,18 @@ bash "$STOP" </dev/null >/dev/null 2>&1; rc=$?
 ( cd "$tmp"; git commit -q --allow-empty -m fix )
 bash "$STOP" </dev/null >/dev/null 2>&1; rc=$?
 [ "$rc" = 0 ] && ok "stop-gate: addressed feedback allows stop (exit 0)" || ko "stop-gate: expected 0 got $rc"
+# UNTRACKED files must also force the worker to commit (git diff alone would miss them, so the
+# work would be silently lost). Tree is clean/committed above; add a new untracked file.
+( cd "$tmp"; echo new > untracked_new.txt )
+bash "$STOP" </dev/null >/dev/null 2>&1; rc=$?
+[ "$rc" = 2 ] && ok "stop-gate: untracked file forces commit (exit 2)" || ko "stop-gate: untracked: expected 2 got $rc"
+( cd "$tmp"; git add -A; git commit -qm addnew )
+bash "$STOP" </dev/null >/dev/null 2>&1; rc=$?
+[ "$rc" = 0 ] && ok "stop-gate: committed new file allows stop (exit 0)" || ko "stop-gate: post-commit: expected 0 got $rc"
+# .gitignore'd files must NOT trip the gate (build artifacts are expected debris).
+( cd "$tmp"; echo 'ignored.log' >> .gitignore; git add .gitignore; git commit -qm gitignore; echo junk > ignored.log )
+bash "$STOP" </dev/null >/dev/null 2>&1; rc=$?
+[ "$rc" = 0 ] && ok "stop-gate: gitignored file does not block stop (exit 0)" || ko "stop-gate: gitignored: expected 0 got $rc"
 # absolute HARNESS_DIR variant (production shape: harness dir OUTSIDE the worktree)
 hd2="$(mktemp -d)"; sleep 1; touch "$hd2/feedback.md"
 HARNESS_DIR="$hd2" bash "$STOP" </dev/null >/dev/null 2>&1; rc=$?
@@ -218,6 +264,55 @@ grep -q 'EnterWorktree|ExitWorktree' "$CTL/worker-harness/settings.template.json
   && grep -q '"WorktreeCreate"' "$CTL/worker-harness/settings.template.json" \
   && ok "settings.template wires guard-worktree (PreToolUse matcher + WorktreeCreate)" \
   || ko "settings.template: guard-worktree not wired"
+
+echo "== guard-write (Bash write-escape wall, L2 speed-bump) =="
+GUARD_WRITE="$CTL/worker-harness/harness-guard-write"
+gww="$(mktemp -d)"; mkdir -p "$gww/wt" "$gww/hd" "$gww/ccd"
+gw() { # <desc> <expected> <command>
+  local desc="$1" exp="$2" cmd="$3" rc
+  printf '{"tool_name":"Bash","tool_input":{"command":%s}}' "$(jq -Rn --arg c "$cmd" '$c')" \
+    | HARNESS_WORKTREE="$gww/wt" HARNESS_DIR="$gww/hd" CLAUDE_CONFIG_DIR="$gww/ccd" \
+      bash "$GUARD_WRITE" >/dev/null 2>&1; rc=$?
+  [ "$rc" = "$exp" ] && ok "guard-write $desc (exit $rc)" || ko "guard-write $desc: expected $exp got $rc"
+}
+gw "allow redirect inside worktree"   0 'echo x > out.txt'
+gw "allow plain command"              0 'npm test'
+gw "allow read from host"             0 'cat /etc/hosts'
+gw "allow pipe redirect inside"       0 'grep foo src/a.ts > results.txt'
+gw "allow tee inside worktree"        0 'echo hi | tee notes.log'
+gw "allow write to HARNESS_DIR"       0 "echo status > $gww/hd/STATUS"
+gw "allow fd-dup 2>&1"                0 'ls -la 2>&1'
+gw "block redirect to host path"      2 'echo x > /etc/passwd'
+gw "block write to config dir (self-disarm)" 2 'echo {} > $CLAUDE_CONFIG_DIR/settings.json'
+gw "block tee to /tmp"                2 'cat data | tee /tmp/evil'
+gw "block cp escaping worktree"       2 'cp secret.txt ../../other/x'
+gw "block mv to host path"            2 'mv a.txt /home/somewhere/b.txt'
+gw "block dd of= host path"           2 'dd if=/dev/zero of=/host/disk'
+gw "block sed -i on ../ escape"       2 'sed -i s/a/b/ ../escape.txt'
+gw "block append ../ escape"          2 'echo x >> ../../../outside.txt'
+rm -rf "$gww"
+grep -q 'harness-guard-write' "$CTL/worker-harness/settings.template.json" \
+  && ok "settings.template wires guard-write on Bash" \
+  || ko "settings.template: guard-write not wired"
+
+echo "== guards fail CLOSED when jq / realpath are missing =="
+# A jq-less (or realpath/python3-less) host must never silently DISARM the guards. Run each
+# guard with a PATH that lacks the tool and assert it denies (exit 2) rather than allowing.
+BASH_BIN="$(command -v bash)"
+# jq absent -> every parsing guard denies.
+for h in "$GUARD_GIT" "$GUARD_PATHS" "$GUARD_SECRETS"; do
+  printf '{"tool_name":"Bash","tool_input":{"command":"ls"}}' | PATH="" "$BASH_BIN" "$h" >/dev/null 2>&1; rc=$?
+  [ "$rc" = 2 ] && ok "$(basename "$h") fails closed without jq (exit 2)" \
+    || ko "$(basename "$h") without jq: expected 2 got $rc"
+done
+# jq present but realpath AND python3 absent -> the path-normalizing guards deny.
+minbin="$(mktemp -d)"; ln -s "$(command -v jq)" "$minbin/jq" 2>/dev/null
+for h in "$GUARD_PATHS" "$GUARD_SECRETS"; do
+  printf '{"tool_name":"Edit","tool_input":{"file_path":"x"}}' | PATH="$minbin" "$BASH_BIN" "$h" >/dev/null 2>&1; rc=$?
+  [ "$rc" = 2 ] && ok "$(basename "$h") fails closed without realpath/python3 (exit 2)" \
+    || ko "$(basename "$h") without realpath/python3: expected 2 got $rc"
+done
+rm -rf "$minbin"
 
 echo "== spawn seams: model routing + per-workspace harness extension (v3.1) =="
 # Hermetic fixture: fake HOME (no real creds), workspace + canonical with one commit.
@@ -504,6 +599,42 @@ vs "schema: empty paths"       1 '[{"name":"a","paths":[],"brief":"x"}]'
 vs "schema: missing brief"     1 '[{"name":"a","paths":["src/a/"]}]'
 vs "schema: non-string tests"  1 '[{"name":"a","paths":["src/a/"],"brief":"x","tests":[1]}]'
 
+echo "== lib: worker_watchdog_action (liveness decision) =="
+ww() { # <desc> <expected> <idle> <warned> [TIMEOUT] [GRACE]
+  local desc="$1" exp="$2" idle="$3" warned="$4" to="${5:-100}" gr="${6:-50}" out
+  out="$( export LOOP_PROJECT="$ws" WORKER_TIMEOUT_SECS="$to" WORKER_HANG_GRACE="$gr"; source "$CTL/lib.sh"; worker_watchdog_action "$idle" "$warned" )"
+  [ "$out" = "$exp" ] && ok "worker_watchdog_action $desc ($out)" || ko "worker_watchdog_action $desc: expected $exp got $out"
+}
+ww "below timeout -> none"        none 50  0
+ww "at timeout, unwarned -> warn" warn 100 0
+ww "past timeout, unwarned -> warn" warn 150 0
+ww "warned but within grace -> none" none 40 1
+ww "warned past grace -> act"     act  60  1
+ww "disabled (timeout 0) -> none" none 9999 0 0 0
+
+echo "== lib: sync_unknown_decision (herdr-down anti-corruption) =="
+su() { # <desc> <expected> <quiet_secs> [SYNC_IDLE_SECS]
+  local desc="$1" exp="$2" q="$3" idle="${4:-120}" out
+  out="$( export LOOP_PROJECT="$ws" SYNC_IDLE_SECS="$idle"; source "$CTL/lib.sh"; sync_unknown_decision "$q" )"
+  [ "$out" = "$exp" ] && ok "sync_unknown_decision $desc ($out)" || ko "sync_unknown_decision $desc: expected $exp got $out"
+}
+su "recent commit -> defer"        defer 10  120
+su "quiet long enough -> ok"       ok    200 120
+su "at threshold -> ok"            ok    120 120
+su "disabled (0) -> ok even fresh" ok    1   0
+
+echo "== lib: backlog_reset_inprogress (crash reconciliation) =="
+bl="$ws/backlog.md"
+printf -- '- [x] done goal\n- [~] stuck goal\n- [ ] fresh goal\n- [~] another stuck\n' > "$bl"
+n="$( source "$CTL/lib.sh"; backlog_reset_inprogress "$bl" )"
+if [ "$n" = 2 ] && grep -qxF -- '- [ ] stuck goal' "$bl" && grep -qxF -- '- [ ] another stuck' "$bl" \
+   && grep -qxF -- '- [x] done goal' "$bl" && ! grep -qF -- '[~]' "$bl"; then
+  ok "backlog_reset_inprogress flips [~] -> [ ], leaves [x]/[ ] intact (reset $n)"
+else ko "backlog_reset_inprogress: wrong result (n=$n)"; fi
+# idempotent: a second pass resets nothing.
+n2="$( source "$CTL/lib.sh"; backlog_reset_inprogress "$bl" )"
+[ "$n2" = 0 ] && ok "backlog_reset_inprogress idempotent (0 on clean backlog)" || ko "backlog_reset_inprogress: expected 0 got $n2"
+
 echo "== lib: progress_compact (bounded PROGRESS.md) =="
 if ( export LOOP_PROJECT="$ws" PROGRESS_MAX_LINES=50 PROGRESS_KEEP_LINES=10
      source "$CTL/lib.sh"
@@ -626,6 +757,17 @@ if ( export LOOP_PROJECT="$wsc"; bash "$CTL/refresh.sh" ) >/dev/null 2>&1 \
    && [ "$(git -C "$wsc/canonical" rev-parse main)" = "$(git -C "$proj" rev-parse main)" ]; then
   ok "refresh: canonical fast-forwarded to the project's main"
 else ko "refresh: canonical did not reach project main"; fi
+
+# D12: with origin's PUSH url blanked (what setup.sh does), a worker-style `git push origin`
+# must FAIL structurally (unroutable url — not a bypassable hook), while the sanctioned publish
+# path still delivers because it pushes to the explicit FETCH url.
+git -C "$wsc/canonical" remote set-url --push origin "no-push://blocked-by-loop.invalid"
+if ( cd "$wsc/canonical" && git push origin HEAD:refs/heads/evil ) >/dev/null 2>&1; then
+  ko "D12: worker-style 'git push origin' succeeded despite blanked push url"
+else ok "D12: 'git push origin' structurally blocked (unroutable push url)"; fi
+if ( export LOOP_PROJECT="$wsc"; bash "$CTL/publish.sh" ) >/dev/null 2>&1; then
+  ok "D12: publish.sh still delivers via the explicit fetch url"
+else ko "D12: publish.sh broke under blanked push url"; fi
 unset LOOP_HOME
 rm -rf "$zf"
 

@@ -4,6 +4,8 @@
 # worker's own Claude, not this script). Race guards, in order:
 #   - herdr agent state 'working'      -> SYNC_DEFERRED, skip (never rebase under a live edit;
 #                                         the next land or a manual sync retries)
+#   - herdr unknown/none (server down) -> defer if the worktree committed within SYNC_IDLE_SECS
+#                                         (can't confirm idle -> don't corrupt a live worktree)
 #   - dirty/staged worktree            -> feedback "commit so I can rebase you", exit 9
 #   - rebase conflict                  -> abort + route conflicting files as feedback, exit 9
 #   ./control/sync.sh <task> [<task> ...]   # rebase the named workers
@@ -31,12 +33,27 @@ for TASK in "${tasks[@]}"; do
     HD="$(harness_dir "$TASK")"
 
     # Never rebase under a worker that is mid-burst — a moving worktree is how you corrupt work.
+    # herdr is the primary signal but best-effort: when it can't report (server down, crashed
+    # pane) agent_state is 'none', NOT 'working', so the old check would happily rebase a
+    # live-but-unreported worker. Fall back to a recency heuristic in that case (SYNC_IDLE_SECS).
     st="$(agent_state "$TASK")"
-    if [ "$st" = working ]; then
-      echo "sync: '$TASK' is busy (agent working) — deferred."
-      progress_log SYNC_DEFERRED "$TASK" "$BRANCH" "agent working; will retry on next land"
-      exit 0
-    fi
+    case "$st" in
+      working)
+        echo "sync: '$TASK' is busy (agent working) — deferred."
+        progress_log SYNC_DEFERRED "$TASK" "$BRANCH" "agent working; will retry on next land"
+        exit 0 ;;
+      idle|blocked|done)
+        : ;;  # herdr confirms the worker is not mid-burst — safe to proceed.
+      *)
+        # Unknown/none: herdr can't confirm. Defer if the worktree committed too recently.
+        last="$(git -C "$WT" log -1 --format=%ct 2>/dev/null || echo 0)"
+        quiet=$(( "$(date +%s)" - ${last:-0} ))
+        if [ "$(sync_unknown_decision "$quiet")" = defer ]; then
+          echo "sync: '$TASK' herdr state unknown and last commit ${quiet}s ago (< ${SYNC_IDLE_SECS}s) — deferring (cannot confirm idle)."
+          progress_log SYNC_DEFERRED "$TASK" "$BRANCH" "herdr unknown; recent activity ${quiet}s; deferred"
+          exit 0
+        fi ;;
+    esac
     if ! git -C "$WT" diff --quiet 2>/dev/null || ! git -C "$WT" diff --cached --quiet 2>/dev/null; then
       mkdir -p "$HD"
       { echo "# Rebase pending onto $BASE_BRANCH — you have uncommitted changes."

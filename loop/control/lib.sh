@@ -85,6 +85,25 @@ if [ -f "$CONFIG_DIR/config.env" ]; then source "$CONFIG_DIR/config.env"; fi
 # Host-mode worker signals: cycles the loop tolerates an unknown/gone herdr agent state before
 # gating anyway (a crashed pane must not strand committed work).
 : "${AGENT_UNKNOWN_GRACE:=6}"
+# Worker liveness watchdog (loop.sh). A hung / spinning / never-committing worker changes no ref
+# and (with herdr up) shows 'working' forever, so without this it pins BUSY=1 and the loop's
+# completion condition is never reached. WORKER_TIMEOUT_SECS = seconds of NO progress (no new
+# commit AND agent state not 'working') before the watchdog nudges the worker; WORKER_HANG_GRACE
+# = extra seconds after that nudge before it auto-respawns (non-destructive: assignment kept,
+# only un-committed scratch dies) and consumes a feedback round. 0 = watchdog OFF (default here
+# keeps an older config's behavior unchanged; the config template turns it on).
+: "${WORKER_TIMEOUT_SECS:=0}"
+: "${WORKER_HANG_GRACE:=300}"
+# sync.sh anti-corruption fallback when herdr can't report a worker's state (server down/crashed
+# pane): rather than blindly rebasing a possibly-live worktree, defer unless it has been quiet
+# (no new commit) for at least this many seconds. 0 = heuristic off (pre-3.3 behavior: rebase any
+# non-'working' worker). The config template turns it on.
+: "${SYNC_IDLE_SECS:=0}"
+# Archive a worker's Claude session transcript(s) to state/logs/<task>.session/ when it is
+# reaped/respawned (best-effort). Workers run in an interactive TUI so there is no --output-format
+# capture; this preserves the *.jsonl session logs so a stalled/derailed worker's reasoning can be
+# reconstructed post-hoc. 0 = off (default; the transcripts die with the reaped config dir).
+: "${LOOP_WORKER_TRANSCRIPT:=0}"
 # Secrets backend: sops (default; sops+age, free, no account) | op (1Password CLI) | plain
 # (legacy cleartext env file — doctor warns loudly).
 : "${SECRET_BACKEND:=sops}"
@@ -237,6 +256,49 @@ worker_tasks() {
 # UTC timestamp (no Math.random/Date restrictions here — this is bash).
 now_utc() { date -u +%FT%TZ 2>/dev/null || echo "unknown"; }
 
+# Liveness watchdog decision (PURE — unit-tested; loop.sh feeds it real times). Given how many
+# seconds a BUSY worker has shown no progress and whether it was already warned once, decide the
+# action. Echoes exactly one of: none | warn | act.
+#   worker_watchdog_action <idle_secs> <already_warned:0|1>
+# Off (echoes none) when WORKER_TIMEOUT_SECS is 0/unset. First it waits WORKER_TIMEOUT_SECS then
+# says 'warn'; after the warning it waits WORKER_HANG_GRACE more then says 'act' (respawn/escalate).
+worker_watchdog_action() {
+  local idle="${1:-0}" warned="${2:-0}" limit
+  [ "${WORKER_TIMEOUT_SECS:-0}" -gt 0 ] || { echo none; return 0; }
+  if [ "$warned" = 1 ]; then limit="${WORKER_HANG_GRACE:-300}"; else limit="${WORKER_TIMEOUT_SECS}"; fi
+  if [ "$idle" -ge "$limit" ]; then
+    if [ "$warned" = 1 ]; then echo act; else echo warn; fi
+  else
+    echo none
+  fi
+}
+
+# Crash reconciliation for the backlog (PURE — unit-tested). loop.sh marks a goal it is working
+# as "- [~]"; if the loop then crashes, next_goal (which only matches "- [ ]") would skip that
+# goal forever and it would be silently lost. On (re)start, flip every "- [~]" back to "- [ ]"
+# so the goal is re-picked. Idempotent. Echoes the number of goals reset.
+#   backlog_reset_inprogress <backlog.md>
+backlog_reset_inprogress() {
+  local f="${1:?}" n
+  [ -f "$f" ] || { echo 0; return 0; }
+  n="$(grep -cE '^- \[~\] ' "$f" 2>/dev/null || true)"; n="${n:-0}"
+  if [ "$n" -gt 0 ]; then
+    local tmp; tmp="$(mktemp)"
+    sed -E 's/^- \[~\] /- [ ] /' "$f" > "$tmp" && mv "$tmp" "$f"
+  fi
+  echo "$n"
+}
+
+# sync.sh decision when herdr can't report a worker's state (PURE — unit-tested). Given how many
+# seconds the worktree has been quiet (no new commit), echo "defer" (too recent — a live worker
+# may be editing) or "ok" (quiet long enough to rebase safely). SYNC_IDLE_SECS=0 -> always "ok".
+#   sync_unknown_decision <quiet_secs>
+sync_unknown_decision() {
+  local quiet="${1:-0}"
+  [ "${SYNC_IDLE_SECS:-0}" -gt 0 ] || { echo ok; return 0; }
+  if [ "$quiet" -lt "${SYNC_IDLE_SECS}" ]; then echo defer; else echo ok; fi
+}
+
 # --- heartbeat exclusivity -------------------------------------------------------------------
 # loop.sh (full-auto) and watch.sh (semi-auto, incl. `loop supervise`) both drive the gate, so
 # running them together double-gates every commit. Each heartbeat claims state/<name>.pid; the
@@ -255,6 +317,23 @@ heartbeat_release() { rm -f "$STATE_DIR/$1.pid" 2>/dev/null || true; }
 # instantly visible here — this replaces the v2 exchange push-event marker). "none" if no branch.
 worker_head() {
   git -C "$CANONICAL" rev-parse --verify -q "refs/heads/$(branch_for "$1")" 2>/dev/null || echo none
+}
+
+# Compact one-line stats for a worker's branch vs the base it forked from — per-slice telemetry
+# for PROGRESS after a land/escalate (workers, unlike the planner, have no token/usage capture,
+# so this "how big was the work" signal is all the operator gets to reconstruct a run). Reads
+# git only; never fails the caller. Call BEFORE land.sh merges (afterwards the merge-base moves).
+#   slice_stats <task>  ->  e.g. "commits=3 +120 -14 files=5"
+slice_stats() {
+  local t="$1" br mb commits sums
+  br="$(branch_for "$t")"
+  git -C "$CANONICAL" rev-parse --verify -q "refs/heads/$br" >/dev/null 2>&1 || { echo "commits=0"; return 0; }
+  mb="$(git -C "$CANONICAL" merge-base "$BASE_BRANCH" "$br" 2>/dev/null || true)"
+  [ -n "$mb" ] || { echo "commits=?"; return 0; }
+  commits="$(git -C "$CANONICAL" rev-list --count "$mb..$br" 2>/dev/null || echo 0)"
+  sums="$(git -C "$CANONICAL" diff --numstat "$mb" "$br" 2>/dev/null \
+          | awk '{i+=($1=="-"?0:$1); d+=($2=="-"?0:$2); f++} END{printf "+%d -%d files=%d", i+0, d+0, f+0}')"
+  echo "commits=${commits:-0} ${sums:-+0 -0 files=0}"
 }
 
 # Append one event to memory/PROGRESS.md (the loop's external memory). Tab-separated.

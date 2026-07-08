@@ -13,6 +13,13 @@ CD="$(claude_cfg_dir "$TASK")"
 
 [ -d "$CANONICAL/.git" ] || die "canonical not found — run ./control/setup.sh first."
 
+# Preflight the worker harness's hard dependencies. The client guards fail CLOSED when jq or
+# realpath/python3 is missing (they would otherwise deny every tool and freeze the worker), so
+# refuse to materialize a worker whose guards can't run at all — surface it here, not mid-run.
+command -v jq >/dev/null 2>&1 || die "jq not found — required by the worker harness guards. Install jq first."
+command -v realpath >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1 \
+  || die "neither realpath nor python3 found — the harness guards need one to normalize paths."
+
 # 1) Git worktree = the worker's box. It shares canonical's refs/objects, so a worker commit is
 #    instantly supervisor-visible (no exchange, no push) and the checked-out BASE_BRANCH in
 #    canonical is structurally un-checkout-able by workers (git refuses double checkouts).

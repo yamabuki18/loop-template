@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# PreToolUse(Bash) — the worktree wall for SHELL writes. guard-paths fences the file-editing
+# tools (Edit/Write/MultiEdit/NotebookEdit), but Bash was uncovered: `echo x > /host/path`,
+# `tee`, `cp`, `mv`, `dd of=`, and `sed -i` can write ANYWHERE on the host — into other
+# worktrees, into a supervisor-owned tests/ tree, and — worst — into the worker's own
+# CLAUDE_CONFIG_DIR, where rewriting settings.json would DISARM the whole client harness on the
+# next session. This guard closes the common escape forms.
+#
+# It is a SPEED-BUMP (L2), NOT a wall: shell parsing is undecidable, so a determined agent can
+# still evade it (variables, eval, a compiled helper). That is by design — the escalation ladder
+# puts the HARD guarantees elsewhere: the gate rejects any branch that touched tests/ (exit 4),
+# push is structurally unreachable (no push URL), and only COMMITTED work is ever gated, so an
+# out-of-worktree scribble never reaches the supervisor. This just removes the trivial footguns.
+# Exit 2 blocks the tool; stderr is shown to Claude.
+
+# Fail closed: needs jq to read the command and realpath/python3 to normalize targets.
+command -v jq >/dev/null 2>&1 || { echo "HARNESS: jq is required by the worker harness but was not found — refusing the tool (fail-closed)." >&2; exit 2; }
+command -v realpath >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1 \
+  || { echo "HARNESS: realpath/python3 is required to normalize paths but neither was found — refusing the tool (fail-closed)." >&2; exit 2; }
+
+input="$(cat)"
+cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null)"
+[ -n "$cmd" ] || exit 0
+
+# Without a declared worktree there is nothing to anchor to (a human outside the loop) — allow.
+wt="${HARNESS_WORKTREE:-}"
+[ -n "$wt" ] || exit 0
+hd="${HARNESS_DIR:-}"
+ccd="${CLAUDE_CONFIG_DIR:-}"
+
+deny() { echo "HARNESS: $1" >&2; exit 2; }
+norm() { realpath -m "$1" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null; }
+
+# Expand the few env vars the worker commonly writes THROUGH so that e.g. an unexpanded
+# "$CLAUDE_CONFIG_DIR/settings.json" (the raw command string arrives with vars unexpanded)
+# resolves to a real path we can range-check. Only these known vars are expanded.
+expand() {
+  local s="$1"
+  s="${s//\$\{CLAUDE_CONFIG_DIR\}/$ccd}"; s="${s//\$CLAUDE_CONFIG_DIR/$ccd}"
+  s="${s//\$\{HARNESS_DIR\}/$hd}";        s="${s//\$HARNESS_DIR/$hd}"
+  s="${s//\$\{HARNESS_WORKTREE\}/$wt}";   s="${s//\$HARNESS_WORKTREE/$wt}"
+  s="${s//\$\{HOME\}/$HOME}";             s="${s//\$HOME/$HOME}"
+  case "$s" in [~]/*) s="$HOME/${s#[~]/}" ;; esac
+  printf '%s' "$s"
+}
+
+# A write target is allowed iff it lands inside the worktree or the out-of-tree harness dir.
+# Relative targets are resolved against the worktree (best-effort: the worker's cwd IS its
+# worktree; a `cd` elsewhere first is an evasion this speed-bump does not chase).
+check_target() {
+  local t abs
+  t="$(expand "$1")"
+  [ -n "$t" ] || return 0
+  case "$t" in
+    /*) abs="$(norm "$t")" ;;
+    *)  abs="$(norm "$wt/$t")" ;;
+  esac
+  [ -n "$abs" ] || return 0
+  if [ -n "$hd" ]; then case "$abs" in "$hd"|"$hd"/*) return 0 ;; esac; fi
+  case "$abs" in
+    "$wt"|"$wt"/*) return 0 ;;
+    *) deny "shell write to '$1' resolves outside your worktree ($wt). v3 workers write ONLY inside their worktree; put status/notes under \$HARNESS_DIR. Host paths, other worktrees, and your own config dir are off-limits." ;;
+  esac
+}
+
+# (A) The worker's own config dir holds the harness settings — never touch it via the shell,
+# read or write (a worker has no legitimate reason to, and writing it disarms the guards).
+if [ -n "$ccd" ]; then
+  ecmd="$(expand "$cmd")"
+  case "$ecmd" in
+    *"$ccd"*) deny "your worker config dir is off-limits to shell commands — it holds the harness hook settings, and touching it could disarm your own guards." ;;
+  esac
+fi
+
+# (B) Output redirections: `>`, `>>`, `&>`, `N>`, `N>>` (fd dups like 2>&1 have no path target
+# and are skipped — the target char class excludes '&'). Each captured target is range-checked.
+while IFS= read -r m; do
+  [ -n "$m" ] || continue
+  t="${m##*>}"                      # strip through the last '>'
+  t="${t#"${t%%[![:space:]]*}"}"    # left-trim whitespace
+  [ -n "$t" ] && check_target "$t"
+done < <(printf '%s\n' "$cmd" | grep -oE '(&|[0-9]*)>>?[[:space:]]*[^[:space:];&|<>()]+' 2>/dev/null || true)
+
+# (C) tee [flags] TARGET...  — last token is the (first) file target.
+while IFS= read -r m; do
+  [ -n "$m" ] || continue
+  t="${m##* }"
+  [ -n "$t" ] && check_target "$t"
+done < <(printf '%s\n' "$cmd" | grep -oE '\btee\b([[:space:]]+-[a-zA-Z]+)*[[:space:]]+[^[:space:];&|<>()]+' 2>/dev/null || true)
+
+# (D) dd of=TARGET
+while IFS= read -r m; do
+  [ -n "$m" ] || continue
+  check_target "${m#of=}"
+done < <(printf '%s\n' "$cmd" | grep -oE '\bof=[^[:space:];&|<>()]+' 2>/dev/null || true)
+
+# (E) cp / mv / install / rsync destination, and sed -i target: destination is the last token of
+# the command segment (split on ; | & so a pipeline's later stage is inspected on its own).
+while IFS= read -r seg; do
+  [ -n "$seg" ] || continue
+  last="${seg##* }"
+  [ -n "$last" ] && check_target "$last"
+done < <(printf '%s' "$cmd" | tr ';|&' '\n' \
+          | grep -E '^[[:space:]]*(cp|mv|install|rsync)[[:space:]]|(^|[[:space:]])sed\b.*(-i\b|--in-place)' 2>/dev/null || true)
+
+exit 0

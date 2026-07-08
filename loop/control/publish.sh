@@ -13,7 +13,10 @@ dest="$(git -C "$CANONICAL" remote get-url origin 2>/dev/null || true)"
 [ -n "$dest" ] || die "canonical has no 'origin' (it was created empty, not from a project repo) — nothing to publish to. Attach with 'loop here' from inside a git project."
 
 PUB="${PUBLISH_BRANCH:-loop/$BASE_BRANCH}"
-git -C "$CANONICAL" push -f origin "refs/heads/$BASE_BRANCH:refs/heads/$PUB"
+# Push to the FETCH url explicitly, NOT the `origin` remote: setup.sh blanks origin's push url
+# with an unroutable sentinel so workers can't push to the operator's real repo (D12). `$dest`
+# above is that fetch url (`remote get-url origin`), so this sanctioned host-side publish works.
+git -C "$CANONICAL" push -f "$dest" "refs/heads/$BASE_BRANCH:refs/heads/$PUB"
 
 echo "publish: $BASE_BRANCH -> $dest  (branch: $PUB)"
 echo "in the project repo:"

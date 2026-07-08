@@ -11,6 +11,18 @@ TASK="${1:?usage: reap.sh <task>}"
 if p="$(agent_pane "$TASK")"; then
   herdr pane close "$p" >/dev/null 2>&1 || true
 fi
+
+# Optionally preserve the worker's Claude session transcript(s) before the config dir is deleted
+# (respawn.sh reaps too, so this also snapshots a stalled worker's reasoning before its reset).
+if [ "${LOOP_WORKER_TRANSCRIPT:-0}" = 1 ]; then
+  cfgdir="$(claude_cfg_dir "$TASK")"
+  if [ -d "$cfgdir" ]; then
+    dest="$LOG_DIR/$TASK.session"; mkdir -p "$dest"
+    find "$cfgdir" -name '*.jsonl' -exec cp -f {} "$dest/" \; 2>/dev/null || true
+    echo "reap: archived '$TASK' transcript(s) to $dest (LOOP_WORKER_TRANSCRIPT=1)"
+  fi
+fi
+
 git -C "$CANONICAL" worktree remove --force "$(worktree_for "$TASK")" 2>/dev/null || true
 git -C "$CANONICAL" worktree remove --force "$REVIEW_DIR/$TASK" 2>/dev/null || true
 git -C "$CANONICAL" branch -D "$(branch_for "$TASK")" 2>/dev/null || true

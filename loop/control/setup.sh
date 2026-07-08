@@ -47,6 +47,18 @@ fi
 git -C "$CANONICAL" show-ref --verify --quiet "refs/heads/$BASE_BRANCH" \
   || die "canonical has no branch '$BASE_BRANCH'. Set BASE_BRANCH in config.env to the repo's default branch, or create it: git -C canonical checkout -b $BASE_BRANCH"
 
+# D12: make pushing to the operator's real project repo STRUCTURALLY unreachable for workers.
+# Worker worktrees share canonical's config, so a worker's `git push origin …` (or `git -C .
+# push`) would target the operator's repo — canonical's clone origin. Blank out origin's PUSH
+# url with an unroutable sentinel: any `git push origin` now fails at URL resolution, and unlike
+# a pre-push hook this cannot be bypassed with `--no-verify`. The sanctioned publish path
+# (publish.sh) pushes to the FETCH url explicitly, so it is unaffected; refresh.sh only fetches.
+# The guard-git regex remains as an L2 speed-bump against a worker that reads the fetch url and
+# pushes to it directly. (Nothing to block when canonical was created empty — no origin.)
+if git -C "$CANONICAL" remote get-url origin >/dev/null 2>&1; then
+  git -C "$CANONICAL" remote set-url --push origin "no-push://blocked-by-loop.invalid" 2>/dev/null || true
+fi
+
 repo_map_refresh   # first structural map for the planner (kept fresh by every land)
 
 echo "[5/5] preflight ..."

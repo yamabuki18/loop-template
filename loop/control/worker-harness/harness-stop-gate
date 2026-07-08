@@ -23,8 +23,13 @@ if [ -f "$fb" ]; then
   fi
 fi
 
-if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
-  echo "HARNESS: you have uncommitted changes. Commit them before finishing — in v3 a commit is instantly visible to the supervisor (shared worktree refs), and only committed work is gated." >&2
+# `git diff` reports only TRACKED changes — a worker that wrote NEW files but never `git add`ed
+# them would pass this check, go idle, and its work would never be committed → never gated →
+# silently lost (the "a commit is publication" premise breaks). Use `git status --porcelain`,
+# which also reports untracked files, so new-but-unstaged work forces the worker to commit it.
+# (`.gitignore`d paths are correctly excluded by porcelain, so build artifacts don't trip it.)
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  echo "HARNESS: you have uncommitted or untracked changes. git add + commit them before finishing — in v3 a commit is instantly visible to the supervisor (shared worktree refs), and only committed work is gated. New files you don't intend to keep should be removed or .gitignore'd." >&2
   exit 2
 fi
 exit 0

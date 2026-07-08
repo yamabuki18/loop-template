@@ -10,6 +10,12 @@
 #      the supervisor's spec" an absolute invariant, independent of each assign.sh.
 #  (3) Otherwise the worker may only edit inside its declared ownership domain (path PREFIXES
 #      in $HARNESS_DIR/owned-paths, set by ./control/assign.sh).
+# Fail closed: this guard needs jq to parse the tool call and realpath (or a python3 fallback)
+# to normalize paths. Without them the `[ -n "$path" ] || exit 0` short-circuit / raw-string
+# fallback would let edits slip past the wall, so we deny instead (spawn.sh preflights both).
+command -v jq >/dev/null 2>&1 || { echo "HARNESS: jq is required by the worker harness but was not found — refusing the tool (fail-closed)." >&2; exit 2; }
+command -v realpath >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1 \
+  || { echo "HARNESS: realpath/python3 is required to normalize paths but neither was found — refusing the tool (fail-closed)." >&2; exit 2; }
 input="$(cat)"
 # D10: also pick up NotebookEdit's notebook_path so notebook edits go through this guard too.
 path="$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_input.path // .tool_input.notebook_path // empty' 2>/dev/null)"
@@ -23,10 +29,12 @@ hd="${HARNESS_DIR:-}"
 
 # D5.3: normalize before matching so tricks like ./tests/x or ../<worktree>/tests/x cannot
 # slip past the prefix check. realpath -m resolves . and .. without requiring the file to
-# exist (edits create new files). Relative paths are resolved against the worktree.
+# exist (edits create new files); a python3 fallback covers hosts without GNU realpath.
+# Relative paths are resolved against the worktree. Never falls back to the raw string.
+norm() { realpath -m "$1" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null; }
 case "$path" in
-  /*) abs="$(realpath -m "$path" 2>/dev/null || echo "$path")" ;;
-  *)  abs="$(realpath -m "$wt/$path" 2>/dev/null || echo "$wt/$path")" ;;
+  /*) abs="$(norm "$path")" ;;
+  *)  abs="$(norm "$wt/$path")" ;;
 esac
 
 # (0) Always-allowed housekeeping: the out-of-tree harness dir (STATUS, notes, ...).
