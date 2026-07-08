@@ -22,6 +22,13 @@ source "$(dirname "$0")/lib.sh"
 
 [ -d "$CANONICAL/.git" ] || die "canonical not found — run ./control/setup.sh first."
 have_credential || die "no credential: run 'claude setup-token' then 'loop secrets edit worker' (or log in to claude on this host)."
+# Heartbeat exclusivity: watch.sh (also behind `loop supervise`) drives the same gate — running
+# both double-gates every commit. Claim loop.pid; refuse while a live watch.pid exists.
+if pid="$(heartbeat_pid_alive watch)"; then
+  die "watch.sh (pid $pid) is already driving the gate — stop it (or 'loop supervise') before loop.sh."
+fi
+heartbeat_claim loop
+trap 'heartbeat_release loop' EXIT
 echo "loop: auth $(auth_mode) mode"
 mkdir -p "$LOG_DIR"
 

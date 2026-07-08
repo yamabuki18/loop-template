@@ -58,4 +58,5 @@ for i in $(seq 1 "$WORKER_COUNT"); do
 done
 
 echo "attaching to herdr (workspace '${ws:-?}' / $PROJECT_NAME). goals: $MEMORY_DIR/backlog.md"
+echo "  full autonomy: press Enter in the 'loop' pane  |  dialogue mode: run 'loop supervise' in a terminal"
 exec herdr

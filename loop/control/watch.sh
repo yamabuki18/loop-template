@@ -13,6 +13,14 @@
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
+# Heartbeat exclusivity: refuse while loop.sh drives the gate (and claim watch.pid so loop.sh
+# refuses in the other direction). See heartbeat_* in lib.sh.
+if pid="$(heartbeat_pid_alive loop)"; then
+  die "loop.sh (pid $pid) is already driving the gate — stop it before watch.sh / loop supervise."
+fi
+heartbeat_claim watch
+trap 'heartbeat_release watch' EXIT
+
 echo "watch: commit-driven gate active (poll ${LOOP_POLL_SECS}s). Workers: $(worker_tasks | tr '\n' ' ')"
 echo "watch: on PASS you'll be notified to run ./control/land.sh <task>. Ctrl-C to stop."
 

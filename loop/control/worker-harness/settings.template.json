@@ -23,7 +23,16 @@
         "hooks": [
           { "type": "command", "command": "__CONTROL_DIR__/worker-harness/harness-guard-secrets" }
         ]
+      },
+      {
+        "matcher": "EnterWorktree|ExitWorktree",
+        "hooks": [
+          { "type": "command", "command": "__CONTROL_DIR__/worker-harness/harness-guard-worktree" }
+        ]
       }
+    ],
+    "WorktreeCreate": [
+      { "hooks": [{ "type": "command", "command": "__CONTROL_DIR__/worker-harness/harness-guard-worktree" }] }
     ],
     "Stop": [
       { "hooks": [{ "type": "command", "command": "__CONTROL_DIR__/worker-harness/harness-stop-gate" }] }

@@ -103,10 +103,15 @@ PLAN_TIMEOUT="${PLAN_TIMEOUT:-900}"
 # captured to a file for usage accounting; stderr still streams through the [planner] prefix.
 # (`2>&1 >file` sends stderr to the sed pipe and stdout to the file — order is deliberate.)
 RESULT_JSON="$PLAN_DIR/planner-result.json"
+# Model routing: the planner authors the decomposition AND the contract tests — quality here
+# multiplies across every worker, so PLANNER_MODEL may point at a stronger model than workers.
+planner_model_args=()
+[ -n "${PLANNER_MODEL:-}" ] && planner_model_args=(--model "$PLANNER_MODEL")
 ( cd "$PLAN_DIR/repo" && \
   secret_exec worker -- timeout --kill-after=30 "$PLAN_TIMEOUT" \
     env CLAUDE_CONFIG_DIR="$PLAN_DIR/cfg" DISABLE_AUTOUPDATER=1 \
     claude -p "$prompt" --output-format json --dangerously-skip-permissions \
+    ${planner_model_args[@]+"${planner_model_args[@]}"} \
 ) 2>&1 > "$RESULT_JSON" | sed 's/^/  [planner] /'
 prc=${PIPESTATUS[0]}
 set -e

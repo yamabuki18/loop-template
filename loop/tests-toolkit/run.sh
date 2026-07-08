@@ -208,6 +208,103 @@ out="$(bash "$SESS" </dev/null 2>/dev/null)"   # no HARNESS_DIR -> must stay sil
 [ -z "$out" ] && ok "session-start silent without HARNESS_DIR" || ko "session-start: emitted without HARNESS_DIR"
 rm -rf "$hd"
 
+echo "== guard-worktree (built-in worktree tools stay supervisor-only) =="
+GUARD_WT="$CTL/worker-harness/harness-guard-worktree"
+for tool in EnterWorktree ExitWorktree WorktreeCreate; do
+  printf '{"tool_name":"%s","tool_input":{}}' "$tool" | bash "$GUARD_WT" >/dev/null 2>&1; rc=$?
+  [ "$rc" = 2 ] && ok "guard-worktree blocks $tool (exit 2)" || ko "guard-worktree $tool: expected 2 got $rc"
+done
+grep -q 'EnterWorktree|ExitWorktree' "$CTL/worker-harness/settings.template.json" \
+  && grep -q '"WorktreeCreate"' "$CTL/worker-harness/settings.template.json" \
+  && ok "settings.template wires guard-worktree (PreToolUse matcher + WorktreeCreate)" \
+  || ko "settings.template: guard-worktree not wired"
+
+echo "== spawn seams: model routing + per-workspace harness extension (v3.1) =="
+# Hermetic fixture: fake HOME (no real creds), workspace + canonical with one commit.
+sx="$(mktemp -d)"
+mkdir -p "$sx/ws" "$sx/home" "$sx/bin"
+touch "$sx/ws/.loop-workspace"
+git -C "$sx/ws" init -q -b main canonical 2>/dev/null || { mkdir -p "$sx/ws/canonical"; git -C "$sx/ws/canonical" init -q -b main; }
+git -C "$sx/ws/canonical" -c user.email=a@b -c user.name=a commit -q --allow-empty -m init
+# Workspace-side harness extension: one executable guard + one advisory overlay.
+mkdir -p "$sx/ws/worker-harness.d"
+printf '#!/bin/sh\nexit 0\n' > "$sx/ws/worker-harness.d/guard-project"; chmod +x "$sx/ws/worker-harness.d/guard-project"
+printf 'PROJECT_LOCAL_RULE: never touch legacy/\n' > "$sx/ws/CLAUDE.worker.local.md"
+if ( export LOOP_PROJECT="$sx/ws" HOME="$sx/home"
+     bash "$CTL/spawn.sh" w1 ) >/dev/null 2>&1; then
+  ok "spawn.sh runs hermetically (no herdr, fake HOME)"
+else ko "spawn.sh failed in hermetic fixture"; fi
+scd="$sx/ws/state/workers/w1/claude"
+jq -e '.hooks.PreToolUse[] | select(.hooks[]?.command | endswith("worker-harness.d/guard-project"))' \
+   "$scd/settings.json" >/dev/null 2>&1 \
+  && ok "spawn: worker-harness.d guard merged into settings.json" \
+  || ko "spawn: project guard missing from settings.json"
+grep -q 'PROJECT_LOCAL_RULE' "$scd/CLAUDE.md" 2>/dev/null \
+  && ok "spawn: CLAUDE.worker.local.md appended to worker CLAUDE.md" \
+  || ko "spawn: local overlay missing from worker CLAUDE.md"
+jq -e '.hooks.PreToolUse[] | select(.matcher=="EnterWorktree|ExitWorktree")' "$scd/settings.json" >/dev/null 2>&1 \
+  && ok "spawn: built-in worktree guard present in generated settings" \
+  || ko "spawn: worktree guard matcher missing"
+# Model routing: a fake `claude` captures its argv; worker-run must pass WORKER_MODEL through.
+cat > "$sx/bin/claude" <<'SHIM'
+#!/bin/sh
+printf '%s\n' "$@" > "${FAKE_CLAUDE_CAPTURE:-/dev/null}"
+exit 0
+SHIM
+chmod +x "$sx/bin/claude"
+( export LOOP_PROJECT="$sx/ws" HOME="$sx/home" PATH="$sx/bin:$PATH" \
+         WORKER_MODEL=test-sonnet FAKE_CLAUDE_CAPTURE="$sx/cap.txt"
+  bash "$CTL/worker-run.sh" w1 </dev/null ) >/dev/null 2>&1 || true
+if grep -qx -- '--model' "$sx/cap.txt" 2>/dev/null && grep -qx 'test-sonnet' "$sx/cap.txt" \
+   && grep -qx -- '--dangerously-skip-permissions' "$sx/cap.txt"; then
+  ok "worker-run: WORKER_MODEL routed as claude --model"
+else ko "worker-run: model flag missing (argv: $(tr '\n' ' ' < "$sx/cap.txt" 2>/dev/null))"; fi
+( export LOOP_PROJECT="$sx/ws" HOME="$sx/home" PATH="$sx/bin:$PATH" \
+         WORKER_MODEL= FAKE_CLAUDE_CAPTURE="$sx/cap2.txt"
+  bash "$CTL/worker-run.sh" w1 </dev/null ) >/dev/null 2>&1 || true
+if ! grep -qx -- '--model' "$sx/cap2.txt" 2>/dev/null; then
+  ok "worker-run: empty WORKER_MODEL keeps the CLI default (no --model)"
+else ko "worker-run: --model passed despite empty WORKER_MODEL"; fi
+
+echo "== supervise.sh (interactive supervision seam, --dry-run) =="
+if out="$( export LOOP_PROJECT="$sx/ws" HOME="$sx/home" PATH="$sx/bin:$PATH" \
+                  CLAUDE_CODE_OAUTH_TOKEN=dummy SUPERVISOR_MODEL=test-opus
+           bash "$CTL/supervise.sh" --dry-run 2>&1 )"; then
+  ok "supervise --dry-run exits 0"
+else ko "supervise --dry-run failed: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')"; fi
+printf '%s' "$out" | grep -q -- '--model test-opus' \
+  && ok "supervise: SUPERVISOR_MODEL routed as claude --model" \
+  || ko "supervise: model flag missing from dry-run command"
+svd="$sx/ws/state/supervisor/claude"
+grep -q 'VERTICAL slices' "$svd/CLAUDE.md" 2>/dev/null && grep -q "Canonical repo : $sx/ws/canonical" "$svd/CLAUDE.md" \
+  && ok "supervise: playbook + generated environment in supervisor CLAUDE.md" \
+  || ko "supervise: supervisor CLAUDE.md incomplete"
+jq -e '.hooks.PreToolUse[0].hooks[0].command | endswith("host-harness/harness-guard-secrets")' \
+   "$svd/settings.json" >/dev/null 2>&1 \
+  && ok "supervise: host-harness secrets guard wired by absolute path" \
+  || ko "supervise: secrets guard missing from supervisor settings"
+
+echo "== heartbeat exclusivity (loop.sh vs watch.sh) =="
+mkdir -p "$sx/ws/state"
+echo $$ > "$sx/ws/state/loop.pid"   # this test process is alive -> watch must refuse
+out="$( export LOOP_PROJECT="$sx/ws" HOME="$sx/home"; bash "$CTL/watch.sh" 2>&1 )"; rc=$?
+[ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'already driving the gate' \
+  && ok "watch.sh refuses while loop.pid is alive" \
+  || ko "watch.sh did not refuse (rc=$rc)"
+echo 99999999 > "$sx/ws/state/loop.pid"   # stale pid -> watch may start (kill after 2s)
+out="$( export LOOP_PROJECT="$sx/ws" HOME="$sx/home"; timeout 2 bash "$CTL/watch.sh" 2>&1 )"; rc=$?
+printf '%s' "$out" | grep -q 'commit-driven gate active' \
+  && ok "watch.sh starts over a stale loop.pid" \
+  || ko "watch.sh blocked by a stale pid (rc=$rc: $(printf '%s' "$out" | head -1))"
+rm -f "$sx/ws/state/loop.pid"
+echo $$ > "$sx/ws/state/watch.pid"   # symmetric direction: live watch.pid -> loop.sh refuses
+out="$( export LOOP_PROJECT="$sx/ws" HOME="$sx/home" CLAUDE_CODE_OAUTH_TOKEN=dummy
+        timeout 5 bash "$CTL/loop.sh" 2>&1 )"; rc=$?
+[ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && printf '%s' "$out" | grep -q 'already driving the gate' \
+  && ok "loop.sh refuses while watch.pid is alive" \
+  || ko "loop.sh did not refuse (rc=$rc)"
+rm -rf "$sx"
+
 echo "== lib: secret_exec (scoped injection, backend contract) =="
 ws="$(mktemp -d)"; touch "$ws/.loop-workspace"
 bin="$(mktemp -d)"

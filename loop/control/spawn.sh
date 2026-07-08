@@ -32,7 +32,27 @@ fi
 mkdir -p "$HD" "$CD"
 sed "s|__CONTROL_DIR__|$CONTROL_DIR|g" \
   "$CONTROL_DIR/worker-harness/settings.template.json" > "$CD/settings.json"
+# Per-WORKSPACE harness extension (the engine stays generic; project constraints live in the
+# workspace, outside both the engine and the project repo):
+#   $CONFIG_DIR/worker-harness.d/*  — executable PreToolUse guards, appended for ALL tools.
+#     Same contract as the engine guards: JSON on stdin, exit 0 = allow / 2 = block (stderr is
+#     shown to the worker). Each guard filters by .tool_name itself.
+#   $CONFIG_DIR/CLAUDE.worker.local.md — advisory (L1) project rules appended to CLAUDE.md.
+# Escalation ladder stays intact per project: rules start in CLAUDE.worker.local.md, get
+# promoted to a worker-harness.d/ guard when repeatedly violated — no engine edit needed.
+if [ -d "$CONFIG_DIR/worker-harness.d" ]; then
+  proj_hooks="$(find "$CONFIG_DIR/worker-harness.d" -maxdepth 1 -type f -perm -u+x 2>/dev/null | sort \
+    | jq -R '{type:"command", command:.}' | jq -s '.')"
+  if [ "$(jq 'length' <<<"$proj_hooks")" -gt 0 ]; then
+    jq --argjson h "$proj_hooks" '.hooks.PreToolUse += [{hooks: $h}]' \
+      "$CD/settings.json" > "$CD/settings.json.tmp" && mv "$CD/settings.json.tmp" "$CD/settings.json"
+  fi
+fi
 cp "$CONTROL_DIR/CLAUDE.worker.md" "$CD/CLAUDE.md"
+if [ -f "$CONFIG_DIR/CLAUDE.worker.local.md" ]; then
+  { echo; echo "# Project-specific rules (workspace overlay)"; echo;
+    cat "$CONFIG_DIR/CLAUDE.worker.local.md"; } >> "$CD/CLAUDE.md"
+fi
 if [ ! -f "$CD/.claude.json" ]; then
   sed "s|__WORKTREE__|$WT|g" "$CONTROL_DIR/worker-claude.template.json" > "$CD/.claude.json"
 fi

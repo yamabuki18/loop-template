@@ -62,6 +62,12 @@ if [ -f "$CONFIG_DIR/config.env" ]; then source "$CONFIG_DIR/config.env"; fi
 : "${WORKER_COUNT:=3}"
 : "${BASE_BRANCH:=main}"
 : "${PROTECTED_PATHS:=tests/}"
+# Model routing (claude --model). Empty = the claude CLI's default. Defaults stay empty here so
+# an older config.env keeps its exact pre-3.1 behavior; the config template routes workers to a
+# cheaper model (sonnet) and the interactive supervisor to a strong one (opus).
+: "${WORKER_MODEL:=}"
+: "${PLANNER_MODEL:=}"
+: "${SUPERVISOR_MODEL:=}"
 # Loop knobs (defaults mirror config.env so loop scripts work even on an older config).
 : "${MAX_FEEDBACK_ROUNDS:=4}"
 : "${LOOP_MAX_CYCLES:=0}"
@@ -230,6 +236,20 @@ worker_tasks() {
 
 # UTC timestamp (no Math.random/Date restrictions here — this is bash).
 now_utc() { date -u +%FT%TZ 2>/dev/null || echo "unknown"; }
+
+# --- heartbeat exclusivity -------------------------------------------------------------------
+# loop.sh (full-auto) and watch.sh (semi-auto, incl. `loop supervise`) both drive the gate, so
+# running them together double-gates every commit. Each heartbeat claims state/<name>.pid; the
+# other refuses to start while that pid is alive. All helpers are rc-0-always EXCEPT
+# heartbeat_pid_alive, which callers must wrap in `if` (lib.sh runs under set -e — D1 class).
+heartbeat_pid_alive() {  # <name> — rc 0 and prints the pid iff that heartbeat still runs
+  local pid
+  pid="$(cat "$STATE_DIR/$1.pid" 2>/dev/null)" || return 1
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+  echo "$pid"
+}
+heartbeat_claim()   { mkdir -p "$STATE_DIR"; echo $$ > "$STATE_DIR/$1.pid"; }
+heartbeat_release() { rm -f "$STATE_DIR/$1.pid" 2>/dev/null || true; }
 
 # Current tip of a worker's branch in canonical (worktrees share refs, so a worker's commit is
 # instantly visible here — this replaces the v2 exchange push-event marker). "none" if no branch.

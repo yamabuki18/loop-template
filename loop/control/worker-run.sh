@@ -28,6 +28,10 @@ export GIT_COMMITTER_NAME="worker-$TASK" GIT_COMMITTER_EMAIL="worker-$TASK@loop.
 export DISABLE_AUTOUPDATER=1
 
 cd "$WT"
-secret_exec worker -- claude --dangerously-skip-permissions || true
+# Model routing: workers are the parallel, high-volume role — config.env routes them to a
+# cheaper model (WORKER_MODEL, default sonnet). Empty = the claude CLI's own default.
+claude_args=(--dangerously-skip-permissions)
+[ -n "${WORKER_MODEL:-}" ] && claude_args=(--model "$WORKER_MODEL" "${claude_args[@]}")
+secret_exec worker -- claude "${claude_args[@]}" || true
 # Keep the pane alive after Claude exits so the operator can inspect/restart in place.
 exec bash
