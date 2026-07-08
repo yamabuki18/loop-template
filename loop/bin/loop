@@ -11,6 +11,13 @@
 #   loop refresh                 absorb the project's new commits into the loop's base
 #   loop workspaces              list every attached project and its fleet
 #   loop init <dir> [repo-url]   create a standalone workspace directory instead of attaching
+#   loop secrets <sub>           manage sops-encrypted secrets: init | edit <scope> | status |
+#                                migrate --yes   (scopes: worker / gate / codex)
+#   loop supervise               interactive supervision: YOU + a strong Claude (SUPERVISOR_MODEL)
+#                                assign/verify/land in dialogue; cheap workers (WORKER_MODEL)
+#                                implement in parallel; watch.sh auto-gates every commit burst
+#   loop handoff "<title>"       queue a plan-mode-approved plan as a backlog goal (--latest
+#                                uses memory/plans/latest.md, captured on ExitPlanMode)
 #   loop update / loop version   update the engine (applies to every workspace) / show version
 #   loop <cmd> [args...]         any control/<cmd>.sh: up, down, run (=loop.sh), dashboard,
 #                                status, doctor, setup, plan, verify, land, spawn, assign, ...
@@ -25,7 +32,7 @@ ENGINE="$(cd "$(dirname "$SELF")/.." && pwd)"
 CTL="$ENGINE/control"
 
 usage() {
-  sed -n '2,19p' "$SELF" | sed 's/^# \{0,1\}//'
+  sed -n '2,27p' "$SELF" | sed 's/^# \{0,1\}//'
   echo
   echo "engine: $ENGINE (v$(cat "$ENGINE/VERSION" 2>/dev/null || echo '?'))"
 }

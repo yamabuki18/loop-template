@@ -16,39 +16,66 @@ ver="$(cat "$ENGINE_DIR/VERSION" 2>/dev/null || echo '?')"
 echo "doctor: engine v$ver at $ENGINE_DIR — mode: $mode, project: $ROOT"
 
 echo "doctor: environment"
-command -v docker >/dev/null 2>&1 && { docker info >/dev/null 2>&1 && ok "docker reachable" || bad "docker installed but not reachable (is the daemon running?)"; } || bad "docker not found"
-command -v git    >/dev/null 2>&1 && ok "git"  || bad "git not found"
-command -v tmux   >/dev/null 2>&1 && ok "tmux" || bad "tmux not found"
-command -v jq     >/dev/null 2>&1 && ok "jq"   || bad "jq not found (required by hooks and the loop)"
+command -v git    >/dev/null 2>&1 && ok "git"    || bad "git not found"
+command -v jq     >/dev/null 2>&1 && ok "jq"     || bad "jq not found (required by hooks and the loop)"
+command -v claude >/dev/null 2>&1 && ok "claude CLI" || bad "claude CLI not found (planner/workers cannot run)"
+if command -v herdr >/dev/null 2>&1; then
+  herdr_ok && ok "herdr (server reachable)" || note "herdr installed but server not running — up.sh starts it (or run 'herdr' once)"
+else
+  bad "herdr not found — install: curl -fsSL https://herdr.dev/install.sh | sh"
+fi
 
 if [ "$QUICK" -eq 0 ]; then
   command -v shellcheck >/dev/null 2>&1 && ok "shellcheck (toolkit tests)" || note "shellcheck absent (tests-toolkit will skip lint)"
-  command -v inotifywait >/dev/null 2>&1 && ok "inotifywait" || note "inotifywait absent — watch/loop fall back to ${LOOP_POLL_SECS}s polling (fine)"
+  if command -v codex >/dev/null 2>&1; then
+    ok "codex CLI (second opinion available; mode: ${SECOND_OPINION:-advise})"
+  else
+    [ "${SECOND_OPINION:-advise}" = off ] \
+      && ok "codex absent, SECOND_OPINION=off (by choice)" \
+      || note "codex CLI absent — second opinion auto-skips (CODEX_SKIP in PROGRESS). Install codex + 'codex login' or 'loop secrets edit codex'."
+  fi
 
   echo "doctor: layout"
   case "$ROOT" in
-    /mnt/*) note "ROOT is under $ROOT (/mnt) — Windows FS via WSL2 is slow and weakens isolation. Prefer a Linux-native path (e.g. ~/dev/...)." ;;
+    /mnt/*) note "ROOT is under $ROOT (/mnt) — Windows FS via WSL2 is slow. Prefer a Linux-native path (e.g. ~/dev/...)." ;;
     *) ok "ROOT on Linux-native FS ($ROOT)" ;;
   esac
 
   echo "doctor: secrets / billing mode"
-  if [ -f "$CONFIG_DIR/secret.env" ]; then
-    perms="$(stat -c '%a' "$CONFIG_DIR/secret.env" 2>/dev/null || echo '?')"
-    [ "$perms" = "600" ] && ok "secret.env perms 600" || note "secret.env perms are $perms — tighten with: chmod 600 $CONFIG_DIR/secret.env"
-    case "$(auth_mode)" in
-      subscription)
-        ok "auth = subscription (CLAUDE_CODE_OAUTH_TOKEN set → Pro/Max quota, no metered API)"
-        [ -n "${ANTHROPIC_API_KEY:-}" ] && note "ANTHROPIC_API_KEY is ALSO set but will be ignored (OAuth token wins; it is not passed to containers)." ;;
-      api)
-        ok "auth = api (ANTHROPIC_API_KEY set → pay-as-you-go metered billing)"
-        note "metered API: a fleet loop can burn many tokens. To use your subscription instead, run 'claude setup-token' and put CLAUDE_CODE_OAUTH_TOKEN in secret.env." ;;
-      none)
-        note "no credential set — add CLAUDE_CODE_OAUTH_TOKEN (subscription) or ANTHROPIC_API_KEY (metered) to secret.env" ;;
-    esac
-    grep -qE 'REPLACE-ME' "$CONFIG_DIR/secret.env" 2>/dev/null && note "secret.env still has a REPLACE-ME placeholder"
-  else
-    note "$CONFIG_DIR/secret.env missing — copy secret.env.example there and add a credential"
-  fi
+  case "$SECRET_BACKEND" in
+    sops)
+      command -v sops >/dev/null 2>&1 && ok "sops" || bad "sops not found (SECRET_BACKEND=sops) — https://github.com/getsops/sops/releases"
+      command -v age-keygen >/dev/null 2>&1 && ok "age" || bad "age not found (SECRET_BACKEND=sops) — apt install age"
+      if [ -f "$SOPS_AGE_KEY_FILE" ]; then
+        perms="$(stat -c '%a' "$SOPS_AGE_KEY_FILE" 2>/dev/null || echo '?')"
+        [ "$perms" = "600" ] && ok "age key present (perms 600)" || note "age key perms are $perms — tighten: chmod 600 $SOPS_AGE_KEY_FILE"
+      else
+        note "no age key yet — run: loop secrets init"
+      fi
+      for s in worker gate codex; do
+        f="$(secret_file "$s")"
+        [ -f "$f" ] || continue
+        if command -v sops >/dev/null 2>&1 && SOPS_AGE_KEY_FILE="$SOPS_AGE_KEY_FILE" sops decrypt "$f" >/dev/null 2>&1; then
+          ok "secret.$s decryptable"
+        else
+          bad "secret.$s present but NOT decryptable with this key ($f)"
+        fi
+      done
+      ;;
+    plain)
+      note "SECRET_BACKEND=plain — PLAINTEXT secrets on a host that RUNS agent processes. Migrate: loop secrets migrate --yes" ;;
+    op)
+      command -v op >/dev/null 2>&1 && ok "1Password CLI (op)" || bad "op not found (SECRET_BACKEND=op)" ;;
+  esac
+  [ -f "$CONFIG_DIR/secret.env" ] && note "legacy v2.2 secret.env still present — migrate: loop secrets migrate --yes"
+  case "$(auth_mode)" in
+    subscription) ok "auth = subscription (OAuth token in worker scope → Pro/Max quota, no metered API)" ;;
+    api)          ok "auth = api (metered billing)"
+                  note "metered API: a fleet loop can burn many tokens. Prefer 'claude setup-token' + loop secrets edit worker." ;;
+    host)         ok "auth = host (workers ride this host's claude login)"
+                  note "host login is your PERSONAL credential; for a scoped one: claude setup-token && loop secrets edit worker" ;;
+    none)         note "no credential — run: claude setup-token && loop secrets edit worker (or log in to claude on this host)" ;;
+  esac
 fi
 
 echo "doctor: project state"
@@ -57,13 +84,19 @@ if [ -d "$CANONICAL/.git" ]; then
 else
   [ "$QUICK" -eq 1 ] && note "canonical not set up yet — run ./control/setup.sh" || bad "canonical not found — run ./control/setup.sh"
 fi
-docker image inspect "$IMAGE" >/dev/null 2>&1 && ok "worker image '$IMAGE' built" || note "worker image '$IMAGE' not built yet (setup.sh/up.sh builds it)"
 
 if [ "$QUICK" -eq 0 ]; then
-  # Orphan detection: state files without a container, and vice versa.
+  # Orphan detection: state files without a worktree, and worktrees without state.
   shopt -s nullglob
   for f in "$STATE_DIR"/*.env; do
-    ( source "$f"; container_exists "$TASK" || note "state/$TASK.env exists but container is gone (orphan) — ./control/reap.sh $TASK or ./control/spawn.sh $TASK" )
+    ( source "$f"
+      [ -e "${WORKTREE:-$(worktree_for "$TASK")}/.git" ] \
+        || note "state/$TASK.env exists but its worktree is gone (orphan) — ./control/reap.sh $TASK or ./control/spawn.sh $TASK" )
+  done
+  for d in "$WORKTREES_DIR"/*/; do
+    [ -d "$d" ] || continue
+    t="$(basename "$d")"
+    [ -f "$STATE_DIR/$t.env" ] || note "worktree '$t' has no state file — ./control/spawn.sh $t re-adopts it"
   done
 fi
 

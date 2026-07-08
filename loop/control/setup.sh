@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time setup. Slow the first time (builds the image); after this you only run up.sh.
+# One-time setup (fast in v3 — no image build). After this you only run up.sh.
 #   ./control/setup.sh [<existing-repo-url-or-path>]
 # If a source repo is given, canonical is cloned from it; otherwise an empty repo is created.
 set -euo pipefail
@@ -7,29 +7,32 @@ source "$(dirname "$0")/lib.sh"
 
 # Self-heal exec bits (a copied/extracted tree may carry them as non-executable). First run as:
 #   bash ./control/setup.sh
-chmod +x "$CONTROL_DIR"/*.sh "$CONTROL_DIR"/worker-prepare \
-         "$CONTROL_DIR"/hooks/* "$CONTROL_DIR"/worker-harness/harness-* \
+chmod +x "$CONTROL_DIR"/*.sh \
+         "$CONTROL_DIR"/worker-harness/harness-* \
          "$CONTROL_DIR"/host-harness/harness-* 2>/dev/null || true
-
-# Tighten secret perms if present (the disposable worker key should not be world-readable).
-[ -f "$CONFIG_DIR/secret.env" ] && chmod 600 "$CONFIG_DIR/secret.env" 2>/dev/null || true
 
 # A repo URL can also be recorded by `loop init` / scaffold.sh in .source-repo.
 SRC="${1:-}"
 [ -z "$SRC" ] && [ -f "$CONFIG_DIR/.source-repo" ]  && SRC="$(cat "$CONFIG_DIR/.source-repo")"
 [ -z "$SRC" ] && [ -f "$CONTROL_DIR/.source-repo" ] && SRC="$(cat "$CONTROL_DIR/.source-repo")"
 
-echo "[1/5] building worker image ($IMAGE)${CLAUDE_CODE_VERSION:+ @ claude-code $CLAUDE_CODE_VERSION} — slow the first time ..."
-# HOST_UID: the in-container `dev` user must share the host uid, or the bind-mounted exchange
-# and the planner's /out are read-only to it (see Dockerfile). Passing it here removes the old
-# "your uid must be 1000" caveat.
-docker build --build-arg HOST_UID="$(id -u)" \
-  ${CLAUDE_CODE_VERSION:+--build-arg CLAUDE_CODE_VERSION="$CLAUDE_CODE_VERSION"} -t "$IMAGE" "$CONTROL_DIR"
+echo "[1/5] host tooling ..."
+command -v git   >/dev/null 2>&1 || die "git not found"
+command -v jq    >/dev/null 2>&1 || die "jq not found (required by hooks and the loop)"
+command -v claude >/dev/null 2>&1 || echo "  WARNING: claude CLI not found — planner/workers cannot run."
+command -v herdr >/dev/null 2>&1 || echo "  WARNING: herdr not found — install: curl -fsSL https://herdr.dev/install.sh | sh"
 
-echo "[2/5] creating directories ..."
-mkdir -p "$STATE_DIR" "$EXCHANGE_DIR" "$REVIEW_DIR" "$LOG_DIR" "$SKILLS_DIR" "$MEMORY_DIR"
+echo "[2/5] secrets (sops+age) ..."
+if [ "$SECRET_BACKEND" = sops ] && command -v sops >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1; then
+  "$CONTROL_DIR/secrets.sh" init --if-needed || true
+else
+  echo "  NOTE: sops/age not ready — set up later with: loop secrets init   (doctor.sh has details)"
+fi
 
-echo "[3/5] canonical repo ..."
+echo "[3/5] creating directories ..."
+mkdir -p "$STATE_DIR" "$WORKTREES_DIR" "$REVIEW_DIR" "$LOG_DIR" "$SKILLS_DIR" "$MEMORY_DIR"
+
+echo "[4/5] canonical repo ..."
 if [ ! -d "$CANONICAL/.git" ]; then
   if [ -n "$SRC" ]; then
     git clone "$SRC" "$CANONICAL"
@@ -39,18 +42,26 @@ if [ ! -d "$CANONICAL/.git" ]; then
     git -C "$CANONICAL" commit --allow-empty -m "init" >/dev/null
   fi
 fi
-
-echo "[4/5] verifying BASE_BRANCH and installing canonical hook ..."
 # D4: fail loudly NOW if the cloned repo's branches don't include BASE_BRANCH, instead of an
-# inscrutable failure later in spawn.sh's `git branch -f "$BRANCH" "$BASE_BRANCH"`.
+# inscrutable failure later in spawn.sh's worktree creation.
 git -C "$CANONICAL" show-ref --verify --quiet "refs/heads/$BASE_BRANCH" \
-  || die "canonical has no branch '$BASE_BRANCH'. Set BASE_BRANCH in control/config.env to the repo's default branch, or create it: git -C canonical checkout -b $BASE_BRANCH"
-cp "$CONTROL_DIR/hooks/pre-receive" "$CANONICAL/.git/hooks/pre-receive"
-chmod +x "$CANONICAL/.git/hooks/pre-receive"
+  || die "canonical has no branch '$BASE_BRANCH'. Set BASE_BRANCH in config.env to the repo's default branch, or create it: git -C canonical checkout -b $BASE_BRANCH"
+
+# D12: make pushing to the operator's real project repo STRUCTURALLY unreachable for workers.
+# Worker worktrees share canonical's config, so a worker's `git push origin …` (or `git -C .
+# push`) would target the operator's repo — canonical's clone origin. Blank out origin's PUSH
+# url with an unroutable sentinel: any `git push origin` now fails at URL resolution, and unlike
+# a pre-push hook this cannot be bypassed with `--no-verify`. The sanctioned publish path
+# (publish.sh) pushes to the FETCH url explicitly, so it is unaffected; refresh.sh only fetches.
+# The guard-git regex remains as an L2 speed-bump against a worker that reads the fetch url and
+# pushes to it directly. (Nothing to block when canonical was created empty — no origin.)
+if git -C "$CANONICAL" remote get-url origin >/dev/null 2>&1; then
+  git -C "$CANONICAL" remote set-url --push origin "no-push://blocked-by-loop.invalid" 2>/dev/null || true
+fi
 
 repo_map_refresh   # first structural map for the planner (kept fresh by every land)
 
 echo "[5/5] preflight ..."
 "$CONTROL_DIR/doctor.sh" --quick || true
-[ -f "$CONFIG_DIR/secret.env" ] || echo "  NOTE: create $CONFIG_DIR/secret.env from control/secret.env.example (DISPOSABLE worker key), then chmod 600."
+secret_present worker || echo "  NOTE: add your Claude credential:  claude setup-token && loop secrets edit worker"
 echo "  Write goals in memory/backlog.md, then start:   ./control/up.sh"

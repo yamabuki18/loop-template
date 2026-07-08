@@ -3,7 +3,7 @@
   "bypassPermissionsModeAccepted": true,
   "theme": "dark",
   "projects": {
-    "/work": {
+    "__WORKTREE__": {
       "allowedTools": [],
       "hasTrustDialogAccepted": true,
       "projectOnboardingSeenCount": 1,

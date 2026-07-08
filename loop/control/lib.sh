@@ -47,26 +47,27 @@ if [ -z "$ROOT" ]; then  # legacy copy-deployed layout
 fi
 
 STATE_DIR="$ROOT/state"
-EXCHANGE_DIR="$ROOT/exchange"
+WORKTREES_DIR="$ROOT/worktrees"
 CANONICAL="$ROOT/canonical"
 REVIEW_DIR="$ROOT/review"
 SKILLS_DIR="$ROOT/skills"
 MEMORY_DIR="$ROOT/memory"
 LOG_DIR="$STATE_DIR/logs"
 
-# --- load config + secret (no error if absent) ---
+# --- load config (no error if absent). Secrets are NEVER sourced into this shell: they stay
+# encrypted at rest and are injected per-scope into exactly one child process by secret_exec().
 if [ -f "$CONFIG_DIR/config.env" ]; then source "$CONFIG_DIR/config.env"; fi
-if [ -f "$CONFIG_DIR/secret.env" ]; then source "$CONFIG_DIR/secret.env"; fi
 
 : "${PROJECT_NAME:=claudeparallel}"
-: "${IMAGE:=claude-worker:latest}"
 : "${WORKER_COUNT:=3}"
 : "${BASE_BRANCH:=main}"
-: "${SESSION:=$PROJECT_NAME}"
-: "${ANTHROPIC_API_KEY:=}"
-: "${CLAUDE_CODE_OAUTH_TOKEN:=}"
-: "${GATE_CACHE:=1}"
 : "${PROTECTED_PATHS:=tests/}"
+# Model routing (claude --model). Empty = the claude CLI's default. Defaults stay empty here so
+# an older config.env keeps its exact pre-3.1 behavior; the config template routes workers to a
+# cheaper model (sonnet) and the interactive supervisor to a strong one (opus).
+: "${WORKER_MODEL:=}"
+: "${PLANNER_MODEL:=}"
+: "${SUPERVISOR_MODEL:=}"
 # Loop knobs (defaults mirror config.env so loop scripts work even on an older config).
 : "${MAX_FEEDBACK_ROUNDS:=4}"
 : "${LOOP_MAX_CYCLES:=0}"
@@ -81,78 +82,164 @@ if [ -f "$CONFIG_DIR/secret.env" ]; then source "$CONFIG_DIR/secret.env"; fi
 : "${PROGRESS_KEEP_LINES:=200}"  # ... keeping this many recent events verbatim
 : "${FEEDBACK_MAX_LINES:=200}"   # cap the gate log routed into a worker's feedback.md
 : "${WIKI_ENABLED:=1}"           # scoped LLM wiki: slice-owned wiki/modules/ pages + scripted index
-: "${CLAUDE_CODE_VERSION:=}"
-: "${BROKER_PORT:=8080}"
-: "${WORKER_EGRESS:=open}"
+# Host-mode worker signals: cycles the loop tolerates an unknown/gone herdr agent state before
+# gating anyway (a crashed pane must not strand committed work).
+: "${AGENT_UNKNOWN_GRACE:=6}"
+# Worker liveness watchdog (loop.sh). A hung / spinning / never-committing worker changes no ref
+# and (with herdr up) shows 'working' forever, so without this it pins BUSY=1 and the loop's
+# completion condition is never reached. WORKER_TIMEOUT_SECS = seconds of NO progress (no new
+# commit AND agent state not 'working') before the watchdog nudges the worker; WORKER_HANG_GRACE
+# = extra seconds after that nudge before it auto-respawns (non-destructive: assignment kept,
+# only un-committed scratch dies) and consumes a feedback round. 0 = watchdog OFF (default here
+# keeps an older config's behavior unchanged; the config template turns it on).
+: "${WORKER_TIMEOUT_SECS:=0}"
+: "${WORKER_HANG_GRACE:=300}"
+# sync.sh anti-corruption fallback when herdr can't report a worker's state (server down/crashed
+# pane): rather than blindly rebasing a possibly-live worktree, defer unless it has been quiet
+# (no new commit) for at least this many seconds. 0 = heuristic off (pre-3.3 behavior: rebase any
+# non-'working' worker). The config template turns it on.
+: "${SYNC_IDLE_SECS:=0}"
+# Archive a worker's Claude session transcript(s) to state/logs/<task>.session/ when it is
+# reaped/respawned (best-effort). Workers run in an interactive TUI so there is no --output-format
+# capture; this preserves the *.jsonl session logs so a stalled/derailed worker's reasoning can be
+# reconstructed post-hoc. 0 = off (default; the transcripts die with the reaped config dir).
+: "${LOOP_WORKER_TRANSCRIPT:=0}"
+# Secrets backend: sops (default; sops+age, free, no account) | op (1Password CLI) | plain
+# (legacy cleartext env file — doctor warns loudly).
+: "${SECRET_BACKEND:=sops}"
+: "${SOPS_AGE_KEY_FILE:=$HOME/.config/sops/age/keys.txt}"
+# Codex second opinion (independent cross-architecture review). off | advise | block.
+: "${SECOND_OPINION:=advise}"
+: "${SECOND_OPINION_PLAN:=}"     # per-phase override; empty = inherit SECOND_OPINION
+: "${SECOND_OPINION_GATE:=}"     # per-phase override; empty = inherit SECOND_OPINION
+: "${CODEX_MODEL:=}"             # empty = codex CLI default
+: "${CODEX_TIMEOUT:=300}"        # seconds; a hung codex must never block the loop
+: "${CODEX_GATE_MAX_ROUNDS:=1}"  # advise mode: max feedback rounds codex-only HIGH concerns may consume
+: "${CODEX_DIFF_MAX_LINES:=4000}" # cap on the diff embedded in the gate-review prompt
 
 # --- naming ---
-cname()      { echo "cw-${PROJECT_NAME}-$1"; }     # container name
-volname()    { echo "cwvol-${PROJECT_NAME}-$1"; }  # /work volume name
-gatecache()  { echo "gatecache-${PROJECT_NAME}"; } # shared package-manager download cache
-branch_for() { echo "work/$1"; }                   # default branch per task
-brokername() { echo "cw-${PROJECT_NAME}-broker"; } # secret-broker container
-netname()    { echo "cwnet-${PROJECT_NAME}"; }     # worker<->broker network (internal if egress=broker-only)
-extnetname() { echo "cwnet-${PROJECT_NAME}-ext"; } # broker's outbound (internet) network when egress is locked
-
-net_exists() { docker network inspect "$1" >/dev/null 2>&1; }
-
-# Ensure the worker network exists with the right reachability for WORKER_EGRESS.
-# open        -> a normal bridge (workers get internet + can reach the broker by name).
-# broker-only -> an --internal bridge (workers can reach ONLY containers on it, no internet).
-ensure_worker_network() {
-  local n; n="$(netname)"
-  if ! net_exists "$n"; then
-    if [ "${WORKER_EGRESS:-open}" = "broker-only" ]; then
-      docker network create --internal "$n" >/dev/null
-    else
-      docker network create "$n" >/dev/null
-    fi
-  fi
-}
-
-# --- predicates (safe under set -e because used in if/while) ---
-container_exists()  { docker ps -a --format '{{.Names}}' | grep -qx "$(cname "$1")"; }
-container_running() { docker ps    --format '{{.Names}}' | grep -qx "$(cname "$1")"; }
+branch_for()     { echo "work/$1"; }                        # default branch per task
+worktree_for()   { echo "$WORKTREES_DIR/$1"; }              # the worker's git worktree
+harness_dir()    { echo "$STATE_DIR/workers/$1/harness"; }  # task.md / feedback.md / owned-paths / STATUS
+claude_cfg_dir() { echo "$STATE_DIR/workers/$1/claude"; }   # per-worker CLAUDE_CONFIG_DIR
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-# --- credential / billing mode -------------------------------------------------------------
-# Two ways to power the in-container Claude (planner + workers):
-#   subscription : CLAUDE_CODE_OAUTH_TOKEN set (from `claude setup-token`, Pro/Max) -> draws on
-#                  your subscription quota (planner `-p` uses the monthly Agent SDK credit;
-#                  interactive workers use the regular interactive limits). NO metered API bill.
-#   api          : ANTHROPIC_API_KEY set -> pay-as-you-go metered API billing.
-# CRITICAL (Claude Code auth precedence): if ANTHROPIC_API_KEY is present it WINS and forces API
-# billing. So in subscription mode we must inject ONLY the OAuth token and NOT the API key.
-auth_mode() {
-  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then echo subscription
-  elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then echo api
-  else echo none; fi
+# --- secrets (scoped, encrypted at rest, injected into exactly one child process) -------------
+# Scopes: worker (the Claude credential), gate (test-time secrets), codex (OPENAI_API_KEY).
+# The file for a scope is secret.<scope>.sops.env (sops backend). A missing scope file is NOT an
+# error: secret_exec then runs the command bare (e.g. codex may use its own `codex login`).
+secret_file() {
+  case "$SECRET_BACKEND" in
+    sops)  echo "$CONFIG_DIR/secret.$1.sops.env" ;;
+    op)    echo "$CONFIG_DIR/secret.$1.op.env" ;;
+    plain) echo "$CONFIG_DIR/secret.$1.env" ;;
+    *)     echo "$CONFIG_DIR/secret.$1.sops.env" ;;
+  esac
 }
-have_credential() { [ "$(auth_mode)" != none ]; }
+secret_present() { [ -f "$(secret_file "$1")" ]; }
 
-# Emit the docker `-e` flags for the chosen credential, one token per line (mapfile-friendly).
-# Exactly one credential is injected; the other is deliberately omitted (see precedence above).
-cred_docker_args() {
-  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-    printf '%s\n' "-e" "CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}"
-  elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
-    printf '%s\n' "-e" "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
+# printf %q-quote every arg into ONE string (sops exec-env historically takes the command as a
+# single shell string; multi-arg only landed in sops >= 3.10 — quote for version robustness).
+shell_quote() { local out="" a; for a in "$@"; do out+="$(printf '%q' "$a") "; done; printf '%s' "${out% }"; }
+
+# Claude Code auth precedence: if ANTHROPIC_API_KEY is present it WINS and forces metered API
+# billing. So for the worker scope, when the OAuth token is set, the API key must be dropped
+# INSIDE the decrypted child env (this shell never sees the values). See auth_mode() below.
+cred_precedence_prelude() {
+  if [ "${1:-}" = worker ]; then
+    printf '%s' 'if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then unset ANTHROPIC_API_KEY; fi; '
   fi
 }
 
-# Emit docker `-e KEY=VALUE` flags from control/secret.gate.env (KEY=VALUE lines). These secrets
-# are injected ONLY into the gate container, which runs deterministic checks (NOT Claude) — so a
-# test can use, e.g., a DB URL or test API key that the worker Claude never sees. mapfile-friendly.
-gate_secret_docker_args() {
-  local f="$CONFIG_DIR/secret.gate.env" line
-  [ -f "$f" ] || return 0
-  while IFS= read -r line; do
-    line="${line%%$'\r'}"
-    case "$line" in ''|'#'*) continue ;; esac
-    [ "${line#*=}" != "$line" ] || continue
-    printf '%s\n' "-e" "$line"
-  done < "$f"
+# secret_exec <scope> -- <cmd> [args...] — run cmd with that scope's secrets in its env ONLY.
+# No scope file -> run bare. All backends route through `sh -c` so the precedence prelude and
+# the version-robust single-string sops contract are identical everywhere.
+secret_exec() {
+  local scope="$1"; shift
+  [ "${1:-}" = "--" ] && shift
+  local f; f="$(secret_file "$scope")"
+  if [ ! -f "$f" ]; then "$@"; return; fi
+  local script; script="$(cred_precedence_prelude "$scope")exec $(shell_quote "$@")"
+  case "$SECRET_BACKEND" in
+    sops)  SOPS_AGE_KEY_FILE="$SOPS_AGE_KEY_FILE" sops exec-env "$f" "$script" ;;
+    op)    op run --env-file="$f" -- sh -c "$script" ;;
+    plain) ( set -a; . "$f"; set +a; exec sh -c "$script" ) ;;
+    *)     die "unknown SECRET_BACKEND '$SECRET_BACKEND' (sops|op|plain)" ;;
+  esac
+}
+
+# --- credential / billing mode -----------------------------------------------------------------
+# How the worker/planner Claude is powered, without ever printing a secret value:
+#   subscription : secret.worker file holds CLAUDE_CODE_OAUTH_TOKEN (`claude setup-token`)
+#   api          : secret.worker file holds ANTHROPIC_API_KEY (metered)
+#   host         : no scope file, but the operator's own `claude` login exists on this host —
+#                  spawn.sh copies it into the per-worker CLAUDE_CONFIG_DIR (v3 host-mode
+#                  convenience; doctor notes the concealment tradeoff)
+#   none         : nothing available — workers cannot run Claude
+_AUTH_MODE_CACHE=""
+auth_mode() {
+  if [ -n "$_AUTH_MODE_CACHE" ]; then echo "$_AUTH_MODE_CACHE"; return 0; fi
+  local probe='if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then echo subscription; elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then echo api; else echo none; fi'
+  local mode=none
+  if secret_present worker; then
+    # One decrypt per process (cached); the probe echoes a MODE, never a value.
+    if mode="$(secret_exec worker -- sh -c "$probe" 2>/dev/null)"; then :; else mode=none; fi
+    case "$mode" in subscription|api) ;; *) mode=none ;; esac
+  fi
+  if [ "$mode" = none ]; then
+    if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then mode=subscription   # exported by the operator (CI etc.)
+    elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then mode=api
+    elif [ -f "$HOME/.claude/.credentials.json" ]; then mode=host
+    fi
+  fi
+  _AUTH_MODE_CACHE="$mode"; echo "$mode"
+}
+have_credential() { [ "$(auth_mode)" != none ]; }
+
+# --- herdr (fleet display, agent-state detection, notifications) --------------------------------
+# herdr is the v3 replacement for tmux: every worker Claude runs in a herdr pane whose agent
+# state (idle/working/blocked) herdr detects natively. ALL calls are best-effort behind
+# herdr_ok — the loop's guarantees (SessionStart/Stop hooks + ref-watching) never depend on it.
+herdr_ok() { command -v herdr >/dev/null 2>&1 && herdr status server >/dev/null 2>&1; }
+# Always returns 0 (empty output when unknown): callers assign `ws="$(herdr_workspace)"` under
+# set -e, and a bare failing substitution would kill the whole script (the D1 class of bug).
+herdr_workspace() { cat "$STATE_DIR/herdr-workspace" 2>/dev/null || true; }
+
+# Agent state for a worker: idle|working|blocked|done|unknown|none (none = no server/agent).
+# Parses `herdr agent get` output defensively (grep for a state token) — the exact format is
+# not contract; worker names (w1..wN) cannot collide with the tokens.
+agent_state() {
+  local t="$1" out st
+  herdr_ok || { echo none; return 0; }
+  if ! out="$(herdr agent get "$t" 2>/dev/null)"; then echo none; return 0; fi
+  st="$(printf '%s\n' "$out" | tr '[:upper:]' '[:lower:]' \
+        | grep -oE '\b(idle|working|blocked|done|unknown)\b' | head -1)"
+  echo "${st:-unknown}"
+}
+
+# The pane id hosting a worker's agent (for send-keys/close). Empty + rc 1 when absent.
+agent_pane() {
+  local t="$1" out p
+  herdr_ok || return 1
+  out="$(herdr agent get "$t" 2>/dev/null)" || return 1
+  p="$(printf '%s\n' "$out" | grep -oE '[A-Za-z0-9_-]+:p[A-Za-z0-9_-]+' | head -1)"
+  [ -n "$p" ] || return 1
+  echo "$p"
+}
+
+# Best-effort nudge into a worker's Claude UI. Text and the submitting Enter go as SEPARATE
+# calls with a pause between them — a combined send races the TUI and can leave the nudge
+# typed-but-unsubmitted (the same bug the tmux send-keys path had). Delivery is still
+# GUARANTEED by the SessionStart/stop-gate hooks, not by this.
+agent_send() {
+  local t="$1"; shift
+  herdr_ok || return 1
+  herdr agent send "$t" "$*" 2>/dev/null || return 1
+  sleep 1
+  local p
+  if p="$(agent_pane "$t")"; then herdr pane send-keys "$p" Enter 2>/dev/null || true; fi
+  return 0
 }
 
 # --- loop helpers (shared by loop.sh / watch.sh / plan.sh / sync.sh) ---
@@ -168,6 +255,86 @@ worker_tasks() {
 
 # UTC timestamp (no Math.random/Date restrictions here — this is bash).
 now_utc() { date -u +%FT%TZ 2>/dev/null || echo "unknown"; }
+
+# Liveness watchdog decision (PURE — unit-tested; loop.sh feeds it real times). Given how many
+# seconds a BUSY worker has shown no progress and whether it was already warned once, decide the
+# action. Echoes exactly one of: none | warn | act.
+#   worker_watchdog_action <idle_secs> <already_warned:0|1>
+# Off (echoes none) when WORKER_TIMEOUT_SECS is 0/unset. First it waits WORKER_TIMEOUT_SECS then
+# says 'warn'; after the warning it waits WORKER_HANG_GRACE more then says 'act' (respawn/escalate).
+worker_watchdog_action() {
+  local idle="${1:-0}" warned="${2:-0}" limit
+  [ "${WORKER_TIMEOUT_SECS:-0}" -gt 0 ] || { echo none; return 0; }
+  if [ "$warned" = 1 ]; then limit="${WORKER_HANG_GRACE:-300}"; else limit="${WORKER_TIMEOUT_SECS}"; fi
+  if [ "$idle" -ge "$limit" ]; then
+    if [ "$warned" = 1 ]; then echo act; else echo warn; fi
+  else
+    echo none
+  fi
+}
+
+# Crash reconciliation for the backlog (PURE — unit-tested). loop.sh marks a goal it is working
+# as "- [~]"; if the loop then crashes, next_goal (which only matches "- [ ]") would skip that
+# goal forever and it would be silently lost. On (re)start, flip every "- [~]" back to "- [ ]"
+# so the goal is re-picked. Idempotent. Echoes the number of goals reset.
+#   backlog_reset_inprogress <backlog.md>
+backlog_reset_inprogress() {
+  local f="${1:?}" n
+  [ -f "$f" ] || { echo 0; return 0; }
+  n="$(grep -cE '^- \[~\] ' "$f" 2>/dev/null || true)"; n="${n:-0}"
+  if [ "$n" -gt 0 ]; then
+    local tmp; tmp="$(mktemp)"
+    sed -E 's/^- \[~\] /- [ ] /' "$f" > "$tmp" && mv "$tmp" "$f"
+  fi
+  echo "$n"
+}
+
+# sync.sh decision when herdr can't report a worker's state (PURE — unit-tested). Given how many
+# seconds the worktree has been quiet (no new commit), echo "defer" (too recent — a live worker
+# may be editing) or "ok" (quiet long enough to rebase safely). SYNC_IDLE_SECS=0 -> always "ok".
+#   sync_unknown_decision <quiet_secs>
+sync_unknown_decision() {
+  local quiet="${1:-0}"
+  [ "${SYNC_IDLE_SECS:-0}" -gt 0 ] || { echo ok; return 0; }
+  if [ "$quiet" -lt "${SYNC_IDLE_SECS}" ]; then echo defer; else echo ok; fi
+}
+
+# --- heartbeat exclusivity -------------------------------------------------------------------
+# loop.sh (full-auto) and watch.sh (semi-auto, incl. `loop supervise`) both drive the gate, so
+# running them together double-gates every commit. Each heartbeat claims state/<name>.pid; the
+# other refuses to start while that pid is alive. All helpers are rc-0-always EXCEPT
+# heartbeat_pid_alive, which callers must wrap in `if` (lib.sh runs under set -e — D1 class).
+heartbeat_pid_alive() {  # <name> — rc 0 and prints the pid iff that heartbeat still runs
+  local pid
+  pid="$(cat "$STATE_DIR/$1.pid" 2>/dev/null)" || return 1
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+  echo "$pid"
+}
+heartbeat_claim()   { mkdir -p "$STATE_DIR"; echo $$ > "$STATE_DIR/$1.pid"; }
+heartbeat_release() { rm -f "$STATE_DIR/$1.pid" 2>/dev/null || true; }
+
+# Current tip of a worker's branch in canonical (worktrees share refs, so a worker's commit is
+# instantly visible here — this replaces the v2 exchange push-event marker). "none" if no branch.
+worker_head() {
+  git -C "$CANONICAL" rev-parse --verify -q "refs/heads/$(branch_for "$1")" 2>/dev/null || echo none
+}
+
+# Compact one-line stats for a worker's branch vs the base it forked from — per-slice telemetry
+# for PROGRESS after a land/escalate (workers, unlike the planner, have no token/usage capture,
+# so this "how big was the work" signal is all the operator gets to reconstruct a run). Reads
+# git only; never fails the caller. Call BEFORE land.sh merges (afterwards the merge-base moves).
+#   slice_stats <task>  ->  e.g. "commits=3 +120 -14 files=5"
+slice_stats() {
+  local t="$1" br mb commits sums
+  br="$(branch_for "$t")"
+  git -C "$CANONICAL" rev-parse --verify -q "refs/heads/$br" >/dev/null 2>&1 || { echo "commits=0"; return 0; }
+  mb="$(git -C "$CANONICAL" merge-base "$BASE_BRANCH" "$br" 2>/dev/null || true)"
+  [ -n "$mb" ] || { echo "commits=?"; return 0; }
+  commits="$(git -C "$CANONICAL" rev-list --count "$mb..$br" 2>/dev/null || echo 0)"
+  sums="$(git -C "$CANONICAL" diff --numstat "$mb" "$br" 2>/dev/null \
+          | awk '{i+=($1=="-"?0:$1); d+=($2=="-"?0:$2); f++} END{printf "+%d -%d files=%d", i+0, d+0, f+0}')"
+  echo "commits=${commits:-0} ${sums:-+0 -0 files=0}"
+}
 
 # Append one event to memory/PROGRESS.md (the loop's external memory). Tab-separated.
 #   progress_log <EVENT> <task/slice> <branch@sha-or-->  <free text note>
@@ -224,26 +391,6 @@ progress_compact() {
     }' "$f" > "$tmp" && mv "$tmp" "$f"
 }
 
-# mtime (epoch) of a worker's push-event marker, or 0 if none yet. The exchange post-receive
-# hook bumps this on every worker push; host-side loops poll it (cheap, mount-safe on WSL2).
-marker_mtime() { stat -c %Y "$EXCHANGE_DIR/$1.git/push-event" 2>/dev/null || echo 0; }
-
-# tmux target of a worker's Claude UI (send-keys / capture-pane). Company-style layout: every
-# worker is a TITLED PANE in the shared 'fleet' window, so the whole fleet is visible on one
-# screen. Resolution: (1) pane titled <task> in fleet (title survives state-file rewrites, so
-# spawn stays idempotent), (2) legacy dedicated window named <task> (pre-fleet sessions keep
-# working). Prints the target and returns 0, or returns 1 when no tmux/pane exists.
-worker_pane() {
-  local t="$1" pid
-  pid="$(tmux list-panes -t "$SESSION:fleet" -F '#{pane_id} #{pane_title}' 2>/dev/null \
-         | awk -v t="$t" '$2==t{print $1; exit}')"
-  if [ -n "$pid" ]; then echo "$pid"; return 0; fi
-  if tmux list-windows -t "$SESSION" -F '#W' 2>/dev/null | grep -qx "$t"; then
-    echo "$SESSION:$t"; return 0
-  fi
-  return 1
-}
-
 # Deterministically validate a planner slices.json BEFORE any worker burns tokens on it.
 # The prompt asks for disjoint, protected-free paths (advisory, L1); this is the structural
 # check (L3) that catches a planner that ignored it — a bad plan otherwise surfaces later as
@@ -286,7 +433,7 @@ validate_slices() {
 
 # Regenerate memory/REPO_MAP.md from canonical — a deterministic structural map (no Claude, no
 # tokens). Called after every land and at setup, so the planner reads a CURRENT map instead of
-# exploring /repo from scratch each cycle (and instead of trusting a hand-written, rotting one).
+# exploring the repo from scratch each cycle (and instead of trusting a hand-written, rotting one).
 repo_map_refresh() {
   [ -d "$CANONICAL/.git" ] || return 0
   mkdir -p "$MEMORY_DIR"
@@ -358,11 +505,50 @@ wiki_index_refresh() {
   } > "$tmp" && mv "$tmp" "$wdir/index.md"
 }
 
+# --- codex second-opinion policy (gate side) ----------------------------------------------------
+# Applies the SECOND_OPINION policy to a gate-time verdict file written by second-opinion.sh.
+#   codex_gate_policy <verdict.json> <task>
+# rc 0 = pass (no concerns, advisory-only concerns, or budget exhausted; logged to PROGRESS).
+# rc 7 = route a feedback round: stdout carries the feedback body for the caller to deliver.
+# The per-task round counter (state/<task>.codex-rounds) bounds advise-mode rounds at
+# CODEX_GATE_MAX_ROUNDS; every routed round ALSO counts toward MAX_FEEDBACK_ROUNDS in loop.sh,
+# so a disagreeing codex can never spin the loop forever. Reset the counter on land.
+codex_gate_policy() {
+  local v="$1" t="$2" mode
+  mode="${SECOND_OPINION_GATE:-${SECOND_OPINION:-advise}}"
+  [ "$mode" = off ] && return 0
+  [ -f "$v" ] || return 0
+  jq -e '.verdict=="concerns"' "$v" >/dev/null 2>&1 || return 0
+  local high
+  high="$(jq -r '[.issues[]? | select(.severity=="high")] | length' "$v" 2>/dev/null)" || high=0
+  if [ "${high:-0}" -eq 0 ]; then
+    progress_log CODEX_ADVISE "$t" "-" "$(jq -c '[.issues[]? | .severity] | group_by(.) | map({(.[0]): length}) | add' "$v" 2>/dev/null || echo '-') low/medium only — pass"
+    return 0
+  fi
+  local cfile="$STATE_DIR/$t.codex-rounds" n
+  n="$(cat "$cfile" 2>/dev/null || echo 0)"
+  if [ "$mode" = advise ] && [ "${n:-0}" -ge "${CODEX_GATE_MAX_ROUNDS:-1}" ]; then
+    progress_log CODEX_ADVISE "$t" "-" "high concerns remain but codex round budget ($n) spent — passing"
+    return 0
+  fi
+  echo $((n + 1)) > "$cfile"
+  {
+    echo "## Independent second-opinion review (codex)"
+    echo "The deterministic checks PASSED, but an independent reviewer flagged issues below."
+    echo "Address the high-severity ones (or explain in code why they do not apply), then commit."
+    echo
+    jq -r '.issues[]? | "- [\(.severity)] \(.note)"' "$v" 2>/dev/null
+  }
+  progress_log CODEX_CONCERNS "$t" "-" "high=$high routed as feedback round $((n + 1))"
+  return 7
+}
+codex_rounds_reset() { rm -f "$STATE_DIR/$1.codex-rounds" 2>/dev/null || true; }
+
 # Best-effort, non-blocking notification. Never fails the caller.
 notify() {
   local msg="$*"
   [ "${NOTIFY:-1}" = "1" ] || return 0
-  tmux has-session -t "$SESSION" 2>/dev/null && tmux display-message "loop: $msg" 2>/dev/null || true
+  herdr_ok && herdr notification show "loop: $PROJECT_NAME" --body "$msg" >/dev/null 2>&1 || true
   printf '\a' 2>/dev/null || true
   command -v wsl-notify-send.exe >/dev/null 2>&1 && wsl-notify-send.exe "$msg" >/dev/null 2>&1 || true
   command -v wsl-notify-send    >/dev/null 2>&1 && wsl-notify-send    "$msg" >/dev/null 2>&1 || true

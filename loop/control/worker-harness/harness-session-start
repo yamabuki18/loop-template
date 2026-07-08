@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # SessionStart — inject the worker's current assignment straight into the session context, so a
-# freshly (re)started worker Claude knows its task WITHOUT relying on a tmux send-keys nudge
-# (send-keys is best-effort and can be dropped while the worker is mid-input). This is the
+# freshly (re)started worker Claude knows its task WITHOUT relying on a herdr send-text nudge
+# (nudges are best-effort and can be dropped while the worker is mid-input). This is the
 # "delivery as a guarantee, not a hope" companion to the stop-gate feedback check (A2).
 #
 # Claude Code reads a SessionStart hook's stdout JSON and merges hookSpecificOutput.additionalContext
 # into the session. We surface the task brief and, if present, any unaddressed supervisor feedback.
-# HARNESS_DIR override exists only for the toolkit's unit tests; unset in the container.
-hdir="${HARNESS_DIR:-/work/.harness}"
+# HARNESS_DIR is the worker's out-of-tree state dir (set by spawn via the pane env); without it
+# there is nothing to inject (e.g. a human session outside the loop) — emit nothing.
+hdir="${HARNESS_DIR:-}"
+[ -n "$hdir" ] || exit 0
 task_file="$hdir/task.md"
 fb_file="$hdir/feedback.md"
 
@@ -21,8 +23,7 @@ fi
 # Nothing to inject -> emit nothing (valid: no additional context).
 [ -n "$ctx" ] || exit 0
 
-# Emit JSON safely. Prefer jq; fall back to a python one-liner only if jq is unavailable
-# (the image ships jq, so the fallback is just defensive).
+# Emit JSON safely. Prefer jq; fall back to a python one-liner only if jq is unavailable.
 if command -v jq >/dev/null 2>&1; then
   jq -nc --arg c "$ctx" \
     '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}'

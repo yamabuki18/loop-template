@@ -45,11 +45,11 @@ here: attached — the project repo itself was NOT touched (zero footprint).
   workspace : $WS
 
 Daily flow (all runnable from inside the project):
-  1. one-time: cp $WS/secret.env.example $WS/secret.env && chmod 600 ...
+  1. one-time: claude setup-token && loop secrets init && loop secrets edit worker
                \$EDITOR $WS/skills/VISION.md ARCHITECTURE.md RULES.md
-               loop setup                    # builds image, clones canonical from the project
+               loop setup                    # clones canonical from the project (no image build)
   2. \$EDITOR $WS/memory/backlog.md          # write goals
-     loop up                                 # fleet + dashboard; loop pane pre-armed
+     loop up                                 # herdr fleet + dashboard; loop pane pre-armed
   3. loop publish                            # landed work -> project branch loop/$BASE_BRANCH
      (in the project) git merge loop/$BASE_BRANCH
   4. loop refresh                            # absorb YOUR new commits into the loop's base

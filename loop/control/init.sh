@@ -30,8 +30,8 @@ WS="$(cd "$WS" && pwd)"
 [ -f "$WS/.loop-workspace" ] && { echo "init: $WS is already a loop workspace — nothing to do."; exit 0; }
 [ "$WS" = "$ENGINE" ] && { echo "init: refusing to turn the engine directory itself into a workspace." >&2; exit 1; }
 
-# PROJECT_NAME namespaces containers/volumes/tmux, so it MUST differ between workspaces —
-# derive it from the directory name (sanitized for docker/tmux) instead of a shared default.
+# PROJECT_NAME namespaces the herdr workspace / notifications, so it MUST differ between
+# workspaces — derive it from the directory name (sanitized) instead of a shared default.
 name="$(printf '%s' "${NAME_OVERRIDE:-$(basename "$WS")}" \
         | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]/-/g' -e 's/^-*//' -e 's/-*$//')"
 [ -n "$name" ] || name="loopws"
@@ -39,11 +39,11 @@ name="$(printf '%s' "${NAME_OVERRIDE:-$(basename "$WS")}" \
 echo "init: creating workspace '$name' in $WS (engine: $ENGINE)"
 
 # config: the engine's config.env is the documented template; only PROJECT_NAME is customized.
-sed "s/^PROJECT_NAME=.*/PROJECT_NAME=$name       # auto-set by loop init (namespaces containers\/volumes\/tmux)/" \
+sed "s/^PROJECT_NAME=.*/PROJECT_NAME=$name       # auto-set by loop init (namespaces the herdr workspace)/" \
   "$CONTROL_DIR/config.env" > "$WS/config.env"
-cp "$CONTROL_DIR/secret.env.example"        "$WS/secret.env.example"
+cp "$CONTROL_DIR/secret.worker.env.example" "$WS/secret.worker.env.example"
 cp "$CONTROL_DIR/secret.gate.env.example"   "$WS/secret.gate.env.example"   2>/dev/null || true
-cp "$CONTROL_DIR/secret.broker.env.example" "$WS/secret.broker.env.example" 2>/dev/null || true
+cp "$CONTROL_DIR/secret.codex.env.example"  "$WS/secret.codex.env.example"  2>/dev/null || true
 
 # Project knowledge templates (the loop reads these every cycle — fill them in).
 mkdir -p "$WS/skills" "$WS/memory"
@@ -51,15 +51,20 @@ for f in "$ENGINE"/skills/*.md;  do [ -e "$WS/skills/$(basename "$f")" ] || cp "
 [ -f "$WS/memory/PROGRESS.md" ] || cp "$ENGINE/memory/PROGRESS.md" "$WS/memory/PROGRESS.md"
 [ -f "$WS/memory/backlog.md" ]  || cp "$ENGINE/memory/backlog.md"  "$WS/memory/backlog.md"
 
-# Never let secrets or runtime state get committed from a workspace.
+# Never let secrets or runtime state get committed from a workspace. Encrypted *.sops.env MAY
+# be committed if your team shares age recipients — opt in by removing those lines (README).
 cat > "$WS/.gitignore" <<'EOF'
 # loop workspace — secrets and runtime state stay out of git
+secret.*.sops.env
+secret.*.op.env
+.sops.yaml
 secret.env
+secret.worker.env
 secret.gate.env
-secret.broker.env
+secret.codex.env
 .source-repo
 state/
-exchange/
+worktrees/
 canonical/
 review/
 EOF
@@ -77,9 +82,9 @@ cat <<EOF
 
 init: workspace ready. Next, in $WS:
   1. \$EDITOR config.env                 (BASE_BRANCH, CHECK_CMD, loop knobs — PROJECT_NAME is set)
-  2. cp secret.env.example secret.env && chmod 600 secret.env
-     -> CLAUDE_CODE_OAUTH_TOKEN (subscription) or a DISPOSABLE ANTHROPIC_API_KEY
+  2. claude setup-token && loop secrets init && loop secrets edit worker
+     -> the credential lives sops-encrypted (never a plaintext file)
   3. \$EDITOR skills/VISION.md skills/ARCHITECTURE.md skills/RULES.md
-  4. loop setup ${REPO:+$REPO}          (builds the image, creates canonical)
+  4. loop setup ${REPO:+$REPO}          (creates canonical — no image build in v3)
   5. write goals in memory/backlog.md, then:  loop up
 EOF

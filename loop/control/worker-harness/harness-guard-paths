@@ -1,30 +1,58 @@
 #!/usr/bin/env bash
-# PreToolUse(Edit/Write) — two structural rules, both fire on every edit:
-#  (1) PROTECTED paths are supervisor-owned: workers can NEVER edit them, regardless of their
+# PreToolUse(Edit/Write) — structural rules, all fire on every edit:
+#  (0) The worker's own harness dir ($HARNESS_DIR: task.md/feedback.md/STATUS/notes) is always
+#      writable — it is out-of-tree state, never part of the repo.
+#  (1) Anything OUTSIDE the worker's git worktree ($HARNESS_WORKTREE) is denied. v3 workers run
+#      on the HOST, so without this rule an agent could edit arbitrary host files. The worktree
+#      is the box; this rule is the wall.
+#  (2) PROTECTED paths are supervisor-owned: workers can NEVER edit them, regardless of their
 #      assigned domain. Set via PROTECTED_PATHS env (default "tests/"). This makes "tests are
 #      the supervisor's spec" an absolute invariant, independent of each assign.sh.
-#  (2) Otherwise the worker may only edit inside its declared ownership domain (path PREFIXES
-#      in /work/.harness/owned-paths, set by ./control/assign.sh).
+#  (3) Otherwise the worker may only edit inside its declared ownership domain (path PREFIXES
+#      in $HARNESS_DIR/owned-paths, set by ./control/assign.sh).
+# Fail closed: this guard needs jq to parse the tool call and realpath (or a python3 fallback)
+# to normalize paths. Without them the `[ -n "$path" ] || exit 0` short-circuit / raw-string
+# fallback would let edits slip past the wall, so we deny instead (spawn.sh preflights both).
+command -v jq >/dev/null 2>&1 || { echo "HARNESS: jq is required by the worker harness but was not found — refusing the tool (fail-closed)." >&2; exit 2; }
+command -v realpath >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1 \
+  || { echo "HARNESS: realpath/python3 is required to normalize paths but neither was found — refusing the tool (fail-closed)." >&2; exit 2; }
 input="$(cat)"
 # D10: also pick up NotebookEdit's notebook_path so notebook edits go through this guard too.
 path="$(printf '%s' "$input" | jq -r '.tool_input.file_path // .tool_input.path // .tool_input.notebook_path // empty' 2>/dev/null)"
 [ -n "$path" ] || exit 0
 
-# D5.3: normalize before matching so tricks like /work/./tests/x or /work/../work/tests/x
-# cannot slip past the prefix check. realpath -m resolves . and .. without requiring the file
-# to exist (edits create new files). Relative paths are resolved against /work.
+# Without a declared worktree root there is nothing to anchor the rules to (e.g. a human
+# running the hook outside the loop) — stay permissive rather than break unrelated sessions.
+wt="${HARNESS_WORKTREE:-}"
+[ -n "$wt" ] || exit 0
+hd="${HARNESS_DIR:-}"
+
+# D5.3: normalize before matching so tricks like ./tests/x or ../<worktree>/tests/x cannot
+# slip past the prefix check. realpath -m resolves . and .. without requiring the file to
+# exist (edits create new files); a python3 fallback covers hosts without GNU realpath.
+# Relative paths are resolved against the worktree. Never falls back to the raw string.
+norm() { realpath -m "$1" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null; }
 case "$path" in
-  /*) abs="$(realpath -m "$path" 2>/dev/null || echo "$path")" ;;
-  *)  abs="$(realpath -m "/work/$path" 2>/dev/null || echo "/work/$path")" ;;
-esac
-rel="${abs#/work/}"
-
-# Always-allowed housekeeping.
-case "$rel" in
-  STATUS|.harness/*) exit 0 ;;
+  /*) abs="$(norm "$path")" ;;
+  *)  abs="$(norm "$wt/$path")" ;;
 esac
 
-# (1) Unconditional protected paths (supervisor-owned). Default: tests/
+# (0) Always-allowed housekeeping: the out-of-tree harness dir (STATUS, notes, ...).
+if [ -n "$hd" ]; then
+  case "$abs" in
+    "$hd"|"$hd"/*) exit 0 ;;
+  esac
+fi
+
+# (1) The worktree is the wall — no host paths.
+case "$abs" in
+  "$wt"/*) rel="${abs#"$wt"/}" ;;
+  *)
+    echo "HARNESS: '$path' is outside your worktree ($wt). v3 workers edit ONLY inside their own worktree; host paths are off-limits. Status/notes go in \$HARNESS_DIR." >&2
+    exit 2 ;;
+esac
+
+# (2) Unconditional protected paths (supervisor-owned). Default: tests/
 protected="${PROTECTED_PATHS:-tests/}"
 for p in $protected; do
   [ -n "$p" ] || continue
@@ -35,11 +63,11 @@ for p in $protected; do
   esac
 done
 
-# (2) Ownership domain. No domain declared yet -> no further restriction.
+# (3) Ownership domain. No domain declared yet -> no further restriction.
 # (HARNESS_OWNED_PATHS override exists only so the toolkit's unit tests can point at a temp file;
-#  in the container it is unset and defaults to the real path — production behavior unchanged.)
-owned="${HARNESS_OWNED_PATHS:-/work/.harness/owned-paths}"
-[ -f "$owned" ] || exit 0
+#  in production it is unset and defaults to $HARNESS_DIR/owned-paths.)
+owned="${HARNESS_OWNED_PATHS:-${hd:+$hd/owned-paths}}"
+[ -n "$owned" ] && [ -f "$owned" ] || exit 0
 while IFS= read -r prefix; do
   [ -n "$prefix" ] || continue
   case "$rel" in

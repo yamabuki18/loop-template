@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Fleet dashboard — the whole company on one screen. The tmux-company pattern's
-# capture-pane monitoring loop, made loop-aware and READ-ONLY: it polls state files, exchange
-# push markers, PROGRESS.md and each worker's tmux pane; it never sends keys to anyone.
+# Fleet dashboard — the whole company on one screen, READ-ONLY: it polls state files, branch
+# refs, PROGRESS.md, herdr agent states and each worker's live pane tail; it never sends keys
+# to anyone.
 #
-#   ./control/dashboard.sh [interval-seconds]   # up.sh runs this in the supervisor window
+#   ./control/dashboard.sh [interval-seconds]   # up.sh runs this in the 'dashboard' pane
 #   ./control/dashboard.sh --once               # render one frame and exit (smoke tests)
 set -uo pipefail
 source "$(dirname "$0")/lib.sh"
-set +e   # a dashboard must never die because one probe (docker/tmux/grep) came back non-zero
+set +e   # a dashboard must never die because one probe (herdr/git/grep) came back non-zero
 
 INTERVAL=3; ONCE=0
 case "${1:-}" in
@@ -57,28 +57,32 @@ render() {
   fi
   printf '\n'
 
-  # Workers: run state, branch, last push, STATUS, and the tail of the live Claude pane.
+  # Workers: agent state, branch, last commit, STATUS, and the tail of the live Claude pane.
   printf '%sWORKERS%s\n' "$BOLD" "$RST"
-  local f t st stcol branch push status pane line any=0
+  local f t st stcol branch commit_epoch commit status line any=0
   shopt -s nullglob
   for f in "$STATE_DIR"/*.env; do
     any=1
     t="$(basename "$f" .env)"
     branch="$(sed -n 's/^BRANCH=//p' "$f" | head -1)"
-    if container_running "$t"; then
-      st="● running"; stcol="$GRN"
-      status="$(docker exec "$(cname "$t")" bash -lc 'tail -1 /work/STATUS 2>/dev/null' 2>/dev/null)"
-    else
-      st="○ stopped"; stcol="$RED"; status=""
-    fi
-    push="$(rel_age "$(marker_mtime "$t")")"
-    printf ' %s%-6s%s %s%s%s  %-18s push %-9s %s\n' \
-      "$BOLD" "$t" "$RST" "$stcol" "$st" "$RST" "$branch" "$push" "${status:+STATUS: $status}" | trunc "$cols"
-    # Last lines of the worker's actual pane (capture-pane) — what it is doing RIGHT NOW.
-    if pane="$(worker_pane "$t")"; then
-      tmux capture-pane -p -t "$pane" 2>/dev/null | sed 's/[[:space:]]*$//' | grep -v '^$' | tail -3 \
-        | while IFS= read -r line; do printf '   %s│ %s%s\n' "$DIM" "$line" "$RST"; done | trunc "$cols"
-    fi
+    st="$(agent_state "$t")"
+    case "$st" in
+      idle)    stcol="$GRN"; st="● idle" ;;
+      working) stcol="$YLW"; st="● working" ;;
+      blocked) stcol="$RED"; st="● blocked" ;;
+      done)    stcol="$CYN"; st="● done" ;;
+      none)    stcol="$RED"; st="○ gone" ;;
+      *)       stcol="$DIM"; st="○ $st" ;;
+    esac
+    status="$(tail -1 "$(harness_dir "$t")/STATUS" 2>/dev/null)"
+    commit_epoch="$(git -C "$CANONICAL" log -1 --format=%ct "$branch" 2>/dev/null || echo 0)"
+    commit="$(rel_age "${commit_epoch:-0}")"
+    printf ' %s%-6s%s %s%-10s%s %-18s commit %-9s %s\n' \
+      "$BOLD" "$t" "$RST" "$stcol" "$st" "$RST" "$branch" "$commit" "${status:+STATUS: $status}" | trunc "$cols"
+    # Last lines of the worker's actual pane (herdr agent read) — what it is doing RIGHT NOW.
+    herdr agent read "$t" --source visible --lines 12 2>/dev/null \
+      | sed 's/[[:space:]]*$//' | grep -v '^$' | tail -3 \
+      | while IFS= read -r line; do printf '   %s│ %s%s\n' "$DIM" "$line" "$RST"; done | trunc "$cols"
   done
   [ "$any" = 1 ] || printf ' %s(no workers — run up.sh / spawn.sh)%s\n' "$DIM" "$RST"
   printf '\n'
@@ -89,14 +93,15 @@ render() {
     | while IFS=$'\t' read -r ts ev who _ note; do   # 4th TSV field (branch@sha) unused here
         local c="$RST"
         case "$ev" in
-          LANDED|GATE_PASS|GOAL_DONE|LOOP_DONE) c="$GRN" ;;
-          GATE_FAIL|LAND_FAIL|PLAN_FAIL)        c="$YLW" ;;
-          ESCALATED)                            c="$RED$BOLD" ;;
-          PLANNED|PLAN_USAGE|ASSIGNED)          c="$CYN" ;;
+          LANDED|GATE_PASS|GOAL_DONE|LOOP_DONE)       c="$GRN" ;;
+          GATE_FAIL|LAND_FAIL|PLAN_FAIL|SYNC_CONFLICT) c="$YLW" ;;
+          ESCALATED)                                   c="$RED$BOLD" ;;
+          PLANNED|PLAN_USAGE|ASSIGNED)                 c="$CYN" ;;
+          CODEX_VERDICT|CODEX_ADVISE|CODEX_CONCERNS|CODEX_PLAN|CODEX_SKIP) c="$CYN" ;;
         esac
-        printf ' %s %s%-10s%s %-4s %s\n' "${ts:11:5}" "$c" "$ev" "$RST" "$who" "$note" | trunc "$cols"
+        printf ' %s %s%-13s%s %-4s %s\n' "${ts:11:5}" "$c" "$ev" "$RST" "$who" "$note" | trunc "$cols"
       done
-  printf '\n%skeys: fleet window = all workers | Ctrl-b z zoom a pane | Ctrl-b Space retile%s\n' "$DIM" "$RST"
+  printf '\n%severy worker is a herdr pane named after its task — click it (mouse) to intervene%s\n' "$DIM" "$RST"
 }
 
 if [ "$ONCE" = 1 ]; then render; exit 0; fi

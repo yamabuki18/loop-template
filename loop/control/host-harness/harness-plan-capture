@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# PostToolUse(ExitPlanMode) — plan-mode -> loop bridge for INTERACTIVE sessions (supervisor
+# pane and, opt-in, the operator's own daily session).
+#
+# The moment a plan is APPROVED (ExitPlanMode succeeded), this hook:
+#   1. persists the plan verbatim to <workspace>/memory/plans/latest.md (deterministic — the
+#      plan text survives even if the session then goes off-script), and
+#   2. injects context steering the session to hand implementation to the FLEET
+#      (`loop handoff`) instead of dropping into auto-edit mode and implementing alone.
+#
+# Best-effort by design: any resolution/write failure exits 0 silently — a capture hook must
+# never break plan approval. It also refuses to act on lib.sh's LEGACY FALLBACK resolution
+# (ROOT = the engine itself) unless the session really runs inside that layout — otherwise a
+# random project without a workspace would write plans into the central engine's memory/.
+input="$(cat)"
+plan="$(printf '%s' "$input" | jq -r '.tool_input.plan // empty' 2>/dev/null)"
+[ -n "$plan" ] || exit 0
+
+had_loop_project="${LOOP_PROJECT:-}"
+# shellcheck source=../lib.sh
+if ! source "$(dirname "$0")/../lib.sh" 2>/dev/null; then exit 0; fi
+set +e  # lib.sh enables -e; from here every failure degrades to a silent no-op
+
+genuine=0
+if [ -n "$had_loop_project" ] || [ -f "$ROOT/.loop-workspace" ]; then
+  genuine=1
+else
+  case "$PWD/" in "$ROOT"/*) genuine=1 ;; esac   # legacy copy-deployed layout, really inside it
+fi
+[ "$genuine" = 1 ] || exit 0
+
+mkdir -p "$MEMORY_DIR/plans" 2>/dev/null || exit 0
+printf '%s\n' "$plan" > "$MEMORY_DIR/plans/latest.md" 2>/dev/null || exit 0
+
+jq -n --arg ctx "HANDOFF: the approved plan was captured to $MEMORY_DIR/plans/latest.md. This project delegates implementation to the loop fleet — do NOT implement the plan in this session. Hand it off now: $CONTROL_DIR/handoff.sh \"<short goal title>\" --latest   (then the workers implement it under the gate; start/keep the heartbeat with loop run or loop supervise)." \
+  '{hookSpecificOutput:{hookEventName:"PostToolUse", additionalContext:$ctx}}' 2>/dev/null
+exit 0

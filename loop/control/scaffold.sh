@@ -44,25 +44,24 @@ cp -r "$MEMORY_DIR"            "$TARGET/memory"  2>/dev/null || true
 [ -f "$ROOT/.gitignore" ] && cp "$ROOT/.gitignore" "$TARGET/.gitignore"
 [ -f "$ROOT/README.md" ]  && cp "$ROOT/README.md"  "$TARGET/README.md"
 # Never carry secrets or per-run state into a new project.
-rm -f  "$TARGET/control/secret.env" "$TARGET/control/secret.broker.env" \
-       "$TARGET/control/secret.gate.env" "$TARGET/control/.source-repo"
-rm -rf "$TARGET/state" "$TARGET/exchange" "$TARGET/review" "$TARGET/canonical"
+rm -f  "$TARGET"/control/secret.*.env "$TARGET"/control/secret.*.sops.env \
+       "$TARGET/control/.sops.yaml" "$TARGET/control/.source-repo"
+rm -rf "$TARGET/state" "$TARGET/worktrees" "$TARGET/review" "$TARGET/canonical"
 # Fresh memory for the new project.
 printf '# BACKLOG\n\n## Goals\n- [ ] <first goal>\n\n## Done\n' > "$TARGET/memory/backlog.md" 2>/dev/null || true
 
 [ -n "$REPO" ] && echo "$REPO" > "$TARGET/control/.source-repo"
 
 # Restore exec bits (cp/tar may have dropped them).
-chmod +x "$TARGET"/control/*.sh "$TARGET"/control/worker-prepare \
-         "$TARGET"/control/hooks/* "$TARGET"/control/worker-harness/harness-* \
+chmod +x "$TARGET"/control/*.sh "$TARGET"/control/worker-harness/harness-* \
          "$TARGET"/control/host-harness/harness-* 2>/dev/null || true
 
 cat <<EOF
 
 scaffold: done. Next, in $TARGET:
   1. edit control/config.env        (PROJECT_NAME, BASE_BRANCH, CHECK_CMD, loop knobs)
-  2. cp control/secret.env.example control/secret.env && chmod 600 control/secret.env
-     -> put a DISPOSABLE, minimally-scoped worker key in it (never your personal key)
+  2. claude setup-token && bash ./control/secrets.sh init && bash ./control/secrets.sh edit worker
+     -> the credential lives sops-encrypted; never as a plaintext file
   3. fill in skills/VISION.md, skills/ARCHITECTURE.md, skills/RULES.md
   4. bash ./control/setup.sh ${REPO:+$REPO}
   5. write goals in memory/backlog.md, then ./control/up.sh  (loop pane is pre-armed)

@@ -1,38 +1,35 @@
 #!/usr/bin/env bash
-# Stop — keep work flowing into the exchange so the acceptance gate stays accurate.
+# Stop — keep work flowing into shared refs so the acceptance gate stays accurate.
 # A Stop hook that exits 2 forces Claude to keep working (with the stderr reason).
 # 0) unaddressed supervisor feedback -> re-engage the worker (delivery guarantee, A2)
-# 1) uncommitted tracked changes      -> commit them (they auto-push on commit)
-# 2) committed but unpushed           -> push (backstop; auto-push usually handles this)
-# HARNESS_WORKDIR override exists only for the toolkit's unit tests; unset in the container.
-cd "${HARNESS_WORKDIR:-/work}" 2>/dev/null || exit 0
-[ -d .git ] || exit 0
+# 1) uncommitted tracked changes      -> commit them (a commit IS publication in v3: the
+#    worktree shares refs with canonical, so the supervisor sees it instantly — no push)
+# HARNESS_WORKDIR override exists only for the toolkit's unit tests; in production the workdir
+# is the worker's worktree ($HARNESS_WORKTREE, set by spawn via the pane env).
+cd "${HARNESS_WORKDIR:-${HARNESS_WORKTREE:-/nonexistent}}" 2>/dev/null || exit 0
+git rev-parse --git-dir >/dev/null 2>&1 || exit 0
 
 # (0) Delivery guarantee: if the supervisor wrote feedback.md AFTER the worker's last commit,
-# the verify FAIL has not been addressed yet. Force the worker back to work even if the tmux
-# send-keys nudge was missed (send-keys is best-effort; this hook is the guarantee). Once the
+# the verify FAIL has not been addressed yet. Force the worker back to work even if the
+# send-text nudge was missed (nudges are best-effort; this hook is the guarantee). Once the
 # worker commits a fix (commit becomes newer) or deletes the transient file, this stops firing.
-fb=".harness/feedback.md"   # relative to the workdir we cd'd into above
+fb="${HARNESS_DIR:-.harness}/feedback.md"
 if [ -f "$fb" ]; then
   last_commit_epoch="$(git log -1 --format=%ct 2>/dev/null || echo 0)"
   fb_epoch="$(stat -c %Y "$fb" 2>/dev/null || echo 0)"
   if [ "${fb_epoch:-0}" -gt "${last_commit_epoch:-0}" ]; then
-    echo "HARNESS: the supervisor's acceptance tests FAILED — read /work/.harness/feedback.md (it is newer than your last commit). Fix the issues, then commit (auto-pushes). Delete the file once addressed." >&2
+    echo "HARNESS: the supervisor's acceptance tests FAILED — read $fb (it is newer than your last commit). Fix the issues, then commit. Delete the file once addressed." >&2
     exit 2
   fi
 fi
 
-if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
-  echo "HARNESS: you have uncommitted changes. Commit them before finishing — commits auto-push to origin, which is what the acceptance gate tests." >&2
+# `git diff` reports only TRACKED changes — a worker that wrote NEW files but never `git add`ed
+# them would pass this check, go idle, and its work would never be committed → never gated →
+# silently lost (the "a commit is publication" premise breaks). Use `git status --porcelain`,
+# which also reports untracked files, so new-but-unstaged work forces the worker to commit it.
+# (`.gitignore`d paths are correctly excluded by porcelain, so build artifacts don't trip it.)
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  echo "HARNESS: you have uncommitted or untracked changes. git add + commit them before finishing — in v3 a commit is instantly visible to the supervisor (shared worktree refs), and only committed work is gated. New files you don't intend to keep should be removed or .gitignore'd." >&2
   exit 2
-fi
-
-upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
-if [ -n "$upstream" ]; then
-  ahead="$(git rev-list --count "${upstream}..HEAD" 2>/dev/null || echo 0)"
-  if [ "${ahead:-0}" -gt 0 ]; then
-    echo "HARNESS: $ahead unpushed commit(s). Run 'git push origin HEAD' and update /work/STATUS before finishing." >&2
-    exit 2
-  fi
 fi
 exit 0

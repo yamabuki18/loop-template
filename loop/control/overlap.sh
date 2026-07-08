@@ -1,21 +1,20 @@
 #!/usr/bin/env bash
 # Conflict radar. Shows each worker branch's changed files (vs BASE_BRANCH) and flags any
 # file touched by more than one worker — i.e. an imminent merge conflict. Run it before
-# assigning new work and before landing.
+# assigning new work and before landing. v3: branches live in canonical (shared worktree
+# refs), so this is one local diff per worker — no exchange fetch.
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
 declare -A OWNERS   # file -> "w1 w2 ..."
 any=0
 
-echo "Per-worker change footprint (vs $BASE_BRANCH, pushed state):"
+echo "Per-worker change footprint (vs $BASE_BRANCH, committed state):"
 shopt -s nullglob
 for f in "$STATE_DIR"/*.env; do
-  source "$f"   # TASK BRANCH CONTAINER EXCHANGE
+  source "$f"   # TASK BRANCH WORKTREE
   any=1
-  # refresh the exchange's copy of base so the diff is accurate after a land
-  git -C "$EXCHANGE" fetch -q "$CANONICAL" "refs/heads/$BASE_BRANCH:refs/heads/$BASE_BRANCH" 2>/dev/null || true
-  files="$(git -C "$EXCHANGE" diff --name-only "${BASE_BRANCH}...${BRANCH}" 2>/dev/null || true)"
+  files="$(git -C "$CANONICAL" diff --name-only "${BASE_BRANCH}...${BRANCH}" 2>/dev/null || true)"
   cnt=0
   while IFS= read -r file; do
     [ -n "$file" ] || continue

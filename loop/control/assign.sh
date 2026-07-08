@@ -17,24 +17,20 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ "${#prefixes[@]}" -ge 1 ] || die "give at least one path prefix, e.g. src/featureA/"
-container_running "$TASK" || die "worker '$TASK' is not running. Run ./control/up.sh first."
+[ -e "$(worktree_for "$TASK")/.git" ] || die "worker '$TASK' has no worktree. Run ./control/spawn.sh $TASK (or up.sh) first."
+st="$(agent_state "$TASK")"
+[ "$st" = none ] && echo "assign: NOTE — no live herdr pane for '$TASK'; the SessionStart hook delivers the task on next launch."
 
-printf '%s\n' "${prefixes[@]}" \
-  | docker exec -i "$(cname "$TASK")" bash -lc 'mkdir -p /work/.harness && cat > /work/.harness/owned-paths'
+HD="$(harness_dir "$TASK")"
+mkdir -p "$HD"
+printf '%s\n' "${prefixes[@]}" > "$HD/owned-paths"
 echo "ownership domain for '$TASK':"; printf '  %s\n' "${prefixes[@]}"
 echo "edits outside these prefixes (and anywhere under $PROTECTED_PATHS) are blocked by the harness."
 
 if [ -n "$BRIEF" ]; then
-  printf '# Task for %s\n\n%s\n' "$TASK" "$BRIEF" \
-    | docker exec -i "$(cname "$TASK")" bash -lc 'mkdir -p /work/.harness && cat > /work/.harness/task.md'
-  echo "wrote task brief to $TASK:/work/.harness/task.md"
-  if pane="$(worker_pane "$TASK")"; then
-    # Send the instruction text and the submitting Enter as SEPARATE send-keys calls. Sending them
-    # in one call races the Claude TUI: the trailing Enter can arrive before the pasted text is
-    # committed to the input box, leaving the nudge typed-but-unsubmitted so the worker never starts.
-    tmux send-keys -t "$pane" "Read /work/.harness/task.md — this is your assignment. Implement on your branch and commit (it auto-pushes). Do not run the test suite; the supervisor verifies."
-    sleep 1
-    tmux send-keys -t "$pane" Enter
+  printf '# Task for %s\n\n%s\n' "$TASK" "$BRIEF" > "$HD/task.md"
+  echo "wrote task brief to $HD/task.md"
+  if agent_send "$TASK" "Read $HD/task.md — this is your assignment. Implement on your branch and commit. Do not run the test suite; the supervisor verifies."; then
     echo "nudged worker '$TASK' to start."
   fi
 fi

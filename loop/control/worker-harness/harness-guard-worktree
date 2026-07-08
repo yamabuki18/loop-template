@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# PreToolUse(EnterWorktree|ExitWorktree) + WorktreeCreate — deterministic wall around Claude
+# Code's BUILT-IN worktree machinery, for workers only.
+#
+# Why: a worker's box IS an engine-managed git worktree of canonical (spawn.sh). The built-in
+# tools would let a worker leave that box (EnterWorktree), spray `worktree-<name>` branches and
+# .claude/worktrees/ checkouts into the SHARED repo (WorktreeCreate, e.g. via a subagent with
+# isolation:worktree), or have them auto-removed at session end — all outside the Bash guard's
+# reach because these are native tools, not shell commands. Same policy as harness-guard-git's
+# `git worktree` rule, enforced on the native-tool surface.
+# Exit 2 blocks the tool; stderr is shown to Claude.
+echo "HARNESS: built-in worktree tools are disabled for workers. Your assigned worktree IS your workspace — implement and commit here; the supervisor manages all worktrees." >&2
+exit 2
