@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# PreToolUse guard (L2, pack: frontend-humble-object) — block the creation/editing
+# of E2E-suite artifacts (e2e/, cypress/, *.e2e.*, *.cy.*, playwright configs) and Bash
+# invocations of E2E runners. Policy: logic is unit-tested via Humble Object separation; a
+# minimal supervisor-owned smoke lives in tests/; interactive browser checks stay allowed —
+# only COMMITTING a suite is out. JSON on stdin, exit 0 = allow / 2 = block. Fails CLOSED
+# without jq (spawn.sh preflights jq anyway).
+set -uo pipefail
+
+CFG="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/gate.d/frontend-testing.env"
+E2E_BLOCK_REGEX=''; E2E_RUN_REGEX=''
+# shellcheck disable=SC1090
+[ -f "$CFG" ] && source "$CFG"
+[ -n "$E2E_BLOCK_REGEX" ] || exit 0
+
+command -v jq >/dev/null 2>&1 || { echo "HARNESS: jq missing — denying to stay fail-closed." >&2; exit 2; }
+payload="$(cat)"
+tool="$(jq -r '.tool_name // ""' <<<"$payload" 2>/dev/null)" || exit 2
+
+case "$tool" in
+  Edit|Write|NotebookEdit)
+    file="$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<<"$payload" 2>/dev/null)"
+    [ -n "$file" ] || exit 0
+    rel="${file#"${HARNESS_WORKTREE:-}/"}"
+    if printf '%s' "$rel" | grep -qE "$E2E_BLOCK_REGEX"; then
+      echo "HARNESS (frontend-humble-object): E2E suites are not part of this project's test strategy — '$rel' is blocked. Extract the logic into a pure function/presenter and unit-test THAT; critical-path smoke tests are supervisor-owned (tests/). The gate re-checks this on the merged tree." >&2
+      exit 2
+    fi ;;
+  Bash)
+    [ -n "$E2E_RUN_REGEX" ] || exit 0
+    cmd="$(jq -r '.tool_input.command // ""' <<<"$payload" 2>/dev/null)"
+    if printf '%s' "$cmd" | grep -qE "$E2E_RUN_REGEX"; then
+      echo "HARNESS (frontend-humble-object): workers do not run E2E runners (the supervisor's gate runs all suites). Unit-test your extracted logic instead." >&2
+      exit 2
+    fi ;;
+esac
+exit 0

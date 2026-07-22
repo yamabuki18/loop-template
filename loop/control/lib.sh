@@ -82,6 +82,23 @@ if [ -f "$CONFIG_DIR/config.env" ]; then source "$CONFIG_DIR/config.env"; fi
 : "${PROGRESS_KEEP_LINES:=200}"  # ... keeping this many recent events verbatim
 : "${FEEDBACK_MAX_LINES:=200}"   # cap the gate log routed into a worker's feedback.md
 : "${WIKI_ENABLED:=1}"           # scoped LLM wiki: slice-owned wiki/modules/ pages + scripted index
+# AIF-style event ontology (memory/ontology/graph.jsonl): host-appended CA/PA nodes derived
+# from loop events (gate FAIL, codex concerns, land, handoff). Zero hand-maintenance by design —
+# the research behind it says hand-curated knowledge structures rot (their staleness then harms
+# like a degraded verifier), so ONLY loop events may write here. 0 = no ontology writes at all.
+: "${ONTOLOGY_ENABLED:=1}"
+# Test-gaming monitor (gate.sh): scan the worker diff for verifier-weakening patterns
+# (.skip/xit/xdescribe/pytest.mark.skip added, assertions deleted wholesale, `|| true` added to
+# check scripts). off | warn (log + PROGRESS, default) | block (fail the gate, exit 6).
+: "${GATE_TESTGAMING:=warn}"
+# Structurally deny worker edits to harness/ (the gate's own check scripts run FROM THE MERGED
+# TREE, so a worker editing harness/check.sh could neuter its own gate — the cheapest reward
+# hack there is). Enforced in gate.sh like PROTECTED_PATHS (exit 4). 1 = on (default).
+: "${GATE_PROTECT_HARNESS:=1}"
+# Design SSOT direct-read (plan.sh): absolute path to a typed-design tree (e.g. a Spec Atlas
+# atlas/ in an external design repo) the planner reads directly. Empty = auto-detect
+# <repo>/atlas/ when present.
+: "${DESIGN_SSOT_DIR:=}"
 # Host-mode worker signals: cycles the loop tolerates an unknown/gone herdr agent state before
 # gating anyway (a crashed pane must not strand committed work).
 : "${AGENT_UNKNOWN_GRACE:=6}"
@@ -505,6 +522,86 @@ wiki_index_refresh() {
   } > "$tmp" && mv "$tmp" "$wdir/index.md"
 }
 
+# --- AIF event ontology (memory/ontology/) ------------------------------------------------------
+# Append-only argument graph derived from LOOP EVENTS ONLY (never hand-written, never
+# LLM-written): I-nodes are the repo's wiki/modules pages (worker-maintained, existing
+# contract); this file holds the S-nodes — CA (conflict: gate FAIL, codex concerns) and PA
+# (preference: land, handoff approval) — in AIF terms (upper ontology fixed here; project
+# forms vocabulary may extend `scheme` values, documented in memory/ontology/README.md).
+# One JSON object per line: {"ts","node":"I|RA|CA|PA","scheme","premise","target","note"}.
+# Contract: ALWAYS rc 0 (best-effort, herdr-style) — an ontology write may never fail a caller.
+ontology_event() { # <node:I|RA|CA|PA> <scheme> <premise> <target> <note>
+  [ "${ONTOLOGY_ENABLED:-1}" = 1 ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local node="${1:-}" scheme="${2:-}" premise="${3:-}" target="${4:-}" note="${5:-}"
+  case "$node" in I|RA|CA|PA) ;; *) return 0 ;; esac
+  mkdir -p "$MEMORY_DIR/ontology" 2>/dev/null || return 0
+  jq -cn --arg ts "$(now_utc)" --arg node "$node" --arg scheme "$scheme" \
+         --arg premise "$premise" --arg target "$target" --arg note "$note" \
+         '{ts:$ts, node:$node, scheme:$scheme, premise:$premise, target:$target, note:$note}' \
+    >> "$MEMORY_DIR/ontology/graph.jsonl" 2>/dev/null || true
+  return 0
+}
+
+# Deterministically summarize the event graph into a small planner-readable digest (same move
+# as wiki_index_refresh / repo_map_refresh: zero tokens, regenerated — never hand-edited).
+# Unresolved CA nodes (conflicts newer than the last PA on the same target) are the signal a
+# planner must see; resolved history is folded into counts.
+ontology_digest_refresh() {
+  [ "${ONTOLOGY_ENABLED:-1}" = 1 ] || return 0
+  local g="$MEMORY_DIR/ontology/graph.jsonl"
+  [ -s "$g" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local tmp; tmp="$(mktemp)"
+  {
+    echo "# Ontology digest — auto-generated from memory/ontology/graph.jsonl on every land."
+    echo "# CA = recorded conflict (gate FAIL / codex concern), PA = recorded acceptance."
+    echo
+    echo "## Open conflicts (CA newer than the target's last PA — treat as unresolved signal)"
+    jq -rs '
+      (map(select(.node=="PA")) | group_by(.target) | map({(. [0].target): (max_by(.ts).ts)}) | add // {}) as $pa
+      | map(select(.node=="CA") | select(.ts > ($pa[.target] // "")))
+      | sort_by(.ts) | .[-20:] | .[]
+      | "- \(.ts) [\(.scheme)] \(.target): \(.note) (premise: \(.premise))"' "$g" 2>/dev/null \
+      || echo "- (digest unavailable)"
+    echo
+    echo "## Totals"
+    jq -rs 'group_by(.node) | map("- \(.[0].node): \(length)") | .[]' "$g" 2>/dev/null || true
+  } > "$tmp" 2>/dev/null && mv "$tmp" "$MEMORY_DIR/ontology/digest.md" 2>/dev/null || rm -f "$tmp"
+  return 0
+}
+
+# --- verifier co-evolution seam ------------------------------------------------------------------
+# When a slice ESCALATES (all feedback rounds burned), the failure is not always the worker's:
+# research on autonomous loops says the VERIFIER is a proxy for intent and must be revised as
+# often as the code ("verification must co-evolve with the generator"). Write a review packet
+# for the human/supervisor that frames BOTH hypotheses — bad implementation vs bad gate/contract
+# tests — instead of silently implying the worker failed. Best-effort: never fails the caller.
+escalation_report() { # <task> <slice> <rounds>
+  local t="${1:-?}" slice="${2:--}" rounds="${3:-?}" d="$STATE_DIR/escalations" ts f
+  mkdir -p "$d" 2>/dev/null || return 0
+  ts="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo now)"
+  f="$d/$t-$ts.md"
+  {
+    echo "# Escalation review packet — $t (slice: $slice)"
+    echo
+    echo "Burned $rounds feedback rounds without passing the gate. Before re-queueing, review"
+    echo "BOTH hypotheses — repeated escalation is as often a verifier defect as a worker defect:"
+    echo
+    echo "1. Implementation is wrong  -> read the last feedback below, re-slice or re-brief."
+    echo "2. The GATE is wrong        -> review tests/ contract tests, harness/check.sh and"
+    echo "   CHECK_CMD for over-strictness, flakiness, or a spec the goal never asked for."
+    echo "   Fixing the verifier here counts as progress — verifiers are revision targets too."
+    echo
+    echo "## Last feedback routed to the worker"
+    echo '```'
+    cat "$(harness_dir "$t")/feedback.md" 2>/dev/null || echo "(no feedback.md on file)"
+    echo '```'
+  } > "$f" 2>/dev/null || return 0
+  echo "$f"
+  return 0
+}
+
 # --- codex second-opinion policy (gate side) ----------------------------------------------------
 # Applies the SECOND_OPINION policy to a gate-time verdict file written by second-opinion.sh.
 #   codex_gate_policy <verdict.json> <task>
@@ -540,6 +637,7 @@ codex_gate_policy() {
     jq -r '.issues[]? | "- [\(.severity)] \(.note)"' "$v" 2>/dev/null
   }
   progress_log CODEX_CONCERNS "$t" "-" "high=$high routed as feedback round $((n + 1))"
+  ontology_event CA codex-concerns "codex:$t" "task:$t" "high=$high routed as feedback round $((n + 1))"
   return 7
 }
 codex_rounds_reset() { rm -f "$STATE_DIR/$1.codex-rounds" 2>/dev/null || true; }

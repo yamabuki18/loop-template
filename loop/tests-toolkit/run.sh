@@ -23,7 +23,7 @@ export PATH="$HERMETIC_BIN:$PATH"
 echo "== bash -n =="
 while IFS= read -r f; do
   if bash -n "$f" 2>/dev/null; then ok "syntax $(basename "$f")"; else ko "syntax $f"; fi
-done < <(find "$CTL" -type f \( -name '*.sh' -o -name 'harness-*' \) ; ls "$CTL/../bin/loop" 2>/dev/null)
+done < <(find "$CTL" "$CTL/../packs" -type f \( -name '*.sh' -o -name 'harness-*' -o -name 'guard-*' \) 2>/dev/null; ls "$CTL/../bin/loop" 2>/dev/null)
 
 # --- 2. lint ---
 echo "== shellcheck =="
@@ -31,7 +31,8 @@ if command -v shellcheck >/dev/null 2>&1; then
   # SC1090 excluded: the toolkit's state files (state/<task>.env) and config are sourced via
   # variables BY DESIGN; shellcheck cannot follow them and the warning is pure noise here.
   if shellcheck -x -S warning -e SC1090 "$CTL"/*.sh "$CTL"/worker-harness/harness-* \
-       "$CTL"/host-harness/harness-* "$CTL/../bin/loop" >/tmp/sc.out 2>&1; then ok "shellcheck clean (>=warning, SC1090 excluded)";
+       "$CTL"/host-harness/harness-* "$CTL/../bin/loop" \
+       "$CTL"/../packs/*/guards/* "$CTL"/../packs/*/check.d/*.sh >/tmp/sc.out 2>&1; then ok "shellcheck clean (>=warning, SC1090 excluded)";
   else ko "shellcheck reported issues:"; sed 's/^/    /' /tmp/sc.out | head -40; fi
 else
   printf '  \033[33mSKIP\033[0m shellcheck not installed\n'
@@ -770,6 +771,241 @@ if ( export LOOP_PROJECT="$wsc"; bash "$CTL/publish.sh" ) >/dev/null 2>&1; then
 else ko "D12: publish.sh broke under blanked push url"; fi
 unset LOOP_HOME
 rm -rf "$zf"
+
+echo "== lib: ontology_event / ontology_digest_refresh (AIF event graph) =="
+ow="$(mktemp -d)"; touch "$ow/.loop-workspace"
+( export LOOP_PROJECT="$ow"
+  source "$CTL/lib.sh"
+  ontology_event CA gate-fail "gate:w1 exit 1" "task:w1" "branch failed acceptance"
+  ontology_event PA landed "gate:w2 pass" "task:w2" "merged"
+  ontology_event XX bogus "a" "b" "must be ignored"          # invalid node -> no write
+) >/dev/null 2>&1
+g="$ow/memory/ontology/graph.jsonl"
+if [ "$(wc -l < "$g" 2>/dev/null)" = 2 ] \
+   && jq -es '[.[] | select(.node=="CA")] | length==1 and .[0].scheme=="gate-fail" and .[0].target=="task:w1"' "$g" >/dev/null 2>&1; then
+  ok "ontology_event appends valid JSONL, drops invalid node types"
+else ko "ontology_event: graph wrong ($(cat "$g" 2>/dev/null))"; fi
+( export LOOP_PROJECT="$ow" ONTOLOGY_ENABLED=0
+  source "$CTL/lib.sh"; ontology_event CA gate-fail p t n ) >/dev/null 2>&1
+[ "$(wc -l < "$g")" = 2 ] && ok "ontology_event: ONTOLOGY_ENABLED=0 is a no-op" \
+                          || ko "ontology_event wrote despite ONTOLOGY_ENABLED=0"
+# digest: CA on w1 has no later PA -> open; CA on w2 older than its PA -> folded.
+( export LOOP_PROJECT="$ow"
+  source "$CTL/lib.sh"
+  printf '{"ts":"2026-01-01T00:00:00Z","node":"CA","scheme":"gate-fail","premise":"g","target":"task:w2","note":"old conflict"}\n' >> "$g"
+  ontology_digest_refresh ) >/dev/null 2>&1
+d="$ow/memory/ontology/digest.md"
+if grep -q 'task:w1: branch failed acceptance' "$d" 2>/dev/null && ! grep -q 'old conflict' "$d" 2>/dev/null; then
+  ok "ontology_digest_refresh: open CA listed, PA-superseded CA folded"
+else ko "ontology_digest_refresh: digest wrong ($(cat "$d" 2>/dev/null | head -6))"; fi
+
+echo "== ontology-check.sh (upper-ontology constraints) =="
+oc() { # <desc> <expected-rc> <jsonl-content>
+  local desc="$1" exp="$2" body="$3" rc f
+  f="$(mktemp)"; printf '%s\n' "$body" > "$f"
+  ( export LOOP_PROJECT="$ow"; bash "$CTL/ontology-check.sh" "$f" ) >/dev/null 2>&1; rc=$?
+  rm -f "$f"
+  [ "$rc" = "$exp" ] && ok "ontology-check $desc (rc $rc)" || ko "ontology-check $desc: expected $exp got $rc"
+}
+oc "valid S-node passes"      0 '{"ts":"2026-01-01T00:00:00Z","node":"CA","scheme":"gate-fail","premise":"g","target":"t","note":"n"}'
+oc "valid I-node passes"      0 '{"ts":"2026-01-01T00:00:00Z","node":"I","scheme":"module","note":"auth module owns login"}'
+oc "S-node without target"    1 '{"ts":"2026-01-01T00:00:00Z","node":"PA","scheme":"landed","premise":"g","note":"n"}'
+oc "I-node with premise (I->I forbidden)" 1 '{"ts":"2026-01-01T00:00:00Z","node":"I","scheme":"m","premise":"x","target":"y","note":"n"}'
+oc "unknown node type"        1 '{"ts":"2026-01-01T00:00:00Z","node":"ZZ","scheme":"m","premise":"x","target":"y"}'
+oc "garbage line"             1 'not json at all'
+( export LOOP_PROJECT="$ow"; bash "$CTL/ontology-check.sh" "$ow/nonexistent.jsonl" ) >/dev/null 2>&1 \
+  && ok "ontology-check: absent graph is fine (rc 0)" || ko "ontology-check: absent graph should pass"
+( export LOOP_PROJECT="$ow"; bash "$CTL/ontology-check.sh" ) >/dev/null 2>&1 \
+  && ok "ontology-check: validates the real event graph (rc 0)" || ko "ontology-check failed on ontology_event output"
+rm -rf "$ow"
+
+echo "== lib: escalation_report (verifier co-evolution seam) =="
+ew="$(mktemp -d)"; touch "$ew/.loop-workspace"
+out="$( export LOOP_PROJECT="$ew"
+  source "$CTL/lib.sh"
+  mkdir -p "$(harness_dir w1)"; echo "the actual failure text" > "$(harness_dir w1)/feedback.md"
+  escalation_report w1 my-slice 5 )"
+if [ -n "$out" ] && [ -f "$out" ] && grep -q 'the actual failure text' "$out" \
+   && grep -q 'The GATE is wrong' "$out"; then
+  ok "escalation_report writes a both-hypotheses packet with the last feedback"
+else ko "escalation_report: packet wrong ($out)"; fi
+rm -rf "$ew"
+
+echo "== gate.sh hardening (harness/ protection, test-gaming monitor, policy checks) =="
+# Hermetic gate fixture: workspace + canonical + a committed work branch, no herdr/codex.
+gws="$(mktemp -d)"; touch "$gws/.loop-workspace"
+mkdir -p "$gws/canonical" "$gws/state"
+git -C "$gws/canonical" init -q -b main
+( cd "$gws/canonical" && git config user.email a@b && git config user.name a \
+  && mkdir -p src harness && echo base > src/app.txt && echo 'exit 0' > harness/check.sh \
+  && git add -A && git commit -qm base )
+printf 'TASK=w1\nBRANCH=work/w1\nWORKTREE=%s/wt\n' "$gws" > "$gws/state/w1.env"
+gate_fixture_branch() { # reset work/w1 to main (worktree first — a checked-out branch can't be deleted)
+  git -C "$gws/canonical" worktree remove --force "$gws/wtx" >/dev/null 2>&1 || true
+  git -C "$gws/canonical" worktree prune >/dev/null 2>&1 || true
+  git -C "$gws/canonical" branch -Df work/w1 >/dev/null 2>&1 || true
+  git -C "$gws/canonical" worktree add -b work/w1 "$gws/wtx" main >/dev/null 2>&1
+}
+gate_run() { # [env pairs...] -> rc
+  ( export LOOP_PROJECT="$gws" SECOND_OPINION=off "$@"
+    bash "$CTL/gate.sh" w1 ) >"$gws/gate.out" 2>&1
+  echo $?
+}
+commit_wtx() { git -C "$gws/wtx" -c user.email=w@l -c user.name=w add -A >/dev/null 2>&1; git -C "$gws/wtx" -c user.email=w@l -c user.name=w commit -qm x >/dev/null 2>&1; }
+# 1) clean branch passes (advisory-free: harness/check.sh exits 0)
+gate_fixture_branch; echo v2 > "$gws/wtx/src/app.txt"; commit_wtx
+rc="$(gate_run)"; [ "$rc" = 0 ] && ok "gate: clean branch passes (rc 0)" || ko "gate clean: rc $rc ($(tail -3 "$gws/gate.out" | tr '\n' ' '))"
+# 2) worker edits harness/check.sh -> exit 4 (gate self-neutering blocked)
+gate_fixture_branch; echo 'exit 0 # tampered' > "$gws/wtx/harness/check.sh"; commit_wtx
+rc="$(gate_run)"; [ "$rc" = 4 ] && ok "gate: harness/ tampering denied (exit 4)" || ko "gate harness-protect: expected 4 got $rc"
+rc="$(gate_run GATE_PROTECT_HARNESS=0)"
+[ "$rc" = 0 ] && ok "gate: GATE_PROTECT_HARNESS=0 disables the harness wall" || ko "gate harness-protect off: expected 0 got $rc"
+# 3) test-gaming monitor: added .skip in a spec file
+gate_fixture_branch
+mkdir -p "$gws/wtx/src"; printf 'it.skip("x", () => {})\n' > "$gws/wtx/src/app.spec.ts"; commit_wtx
+rc="$(gate_run GATE_TESTGAMING=block)"
+[ "$rc" = 6 ] && ok "gate: test-gaming (it.skip) blocked (exit 6)" || ko "gate gaming block: expected 6 got $rc"
+rc="$(gate_run GATE_TESTGAMING=warn)"
+if [ "$rc" = 0 ] && grep -q 'test-gaming patterns' "$gws/gate.out"; then
+  ok "gate: test-gaming warn mode logs but passes"
+else ko "gate gaming warn: rc $rc"; fi
+grep -q $'\tTESTGAMING\t' "$gws/memory/PROGRESS.md" 2>/dev/null \
+  && ok "gate: TESTGAMING event logged to PROGRESS" || ko "gate: TESTGAMING event missing"
+jq -e 'select(.node=="CA" and .scheme=="test-gaming")' "$gws/memory/ontology/graph.jsonl" >/dev/null 2>&1 \
+  && ok "gate: test-gaming recorded as CA ontology node" || ko "gate: gaming CA node missing"
+rc="$(gate_run GATE_TESTGAMING=off)"
+if [ "$rc" = 0 ] && ! grep -q 'test-gaming patterns' "$gws/gate.out"; then
+  ok "gate: GATE_TESTGAMING=off skips the monitor"
+else ko "gate gaming off: rc $rc"; fi
+# 4) non-test file with .skip must NOT trip the monitor
+gate_fixture_branch; printf 'queue.skip(item)\n' > "$gws/wtx/src/queue.ts"; commit_wtx
+rc="$(gate_run GATE_TESTGAMING=block)"
+[ "$rc" = 0 ] && ok "gate: .skip outside test files ignored" || ko "gate gaming false-positive: rc $rc"
+# 5) workspace gate.d checks run on the merged tree with the GATE_* env contract
+mkdir -p "$gws/gate.d"
+cat > "$gws/gate.d/99-probe.sh" <<'EOF'
+#!/usr/bin/env bash
+[ -n "$GATE_TASK" ] && [ -n "$GATE_MERGE_BASE" ] && [ -n "$GATE_BRANCH" ] || exit 9
+grep -q v2 src/app.txt || exit 8   # merged tree contains the worker change
+exit "${POLICY_PROBE_RC:-0}"
+EOF
+gate_fixture_branch; echo v2 > "$gws/wtx/src/app.txt"; commit_wtx
+rc="$(gate_run)"; [ "$rc" = 0 ] && ok "gate: passing gate.d check keeps the gate green" || ko "gate.d pass: rc $rc ($(tail -3 "$gws/gate.out" | tr '\n' ' '))"
+rc="$(gate_run POLICY_PROBE_RC=7)"
+if [ "$rc" = 7 ] && grep -q 'gate.d check 99-probe.sh' "$gws/gate.out"; then
+  ok "gate: failing gate.d check fails the gate with its exit code"
+else ko "gate.d fail: expected 7 got $rc"; fi
+git -C "$gws/canonical" worktree remove --force "$gws/wtx" >/dev/null 2>&1 || true
+rm -rf "$gws"
+
+echo "== harness.sh (packs -> existing harness/gate seams) =="
+pw="$(mktemp -d)"; touch "$pw/.loop-workspace"; mkdir -p "$pw/skills" "$pw/memory"
+hns() { ( export LOOP_PROJECT="$pw"; bash "$CTL/harness.sh" "$@" ) ; }
+hns list >"$pw/list.out" 2>&1 \
+  && grep -q backend-clean-arch "$pw/list.out" && grep -q frontend-humble-object "$pw/list.out" \
+  && grep -q ontology-aif "$pw/list.out" \
+  && ok "harness list: shows the shipped packs" \
+  || ko "harness list wrong: $(cat "$pw/list.out")"
+hns apply backend-clean-arch frontend-humble-object ontology-aif >/dev/null 2>&1 \
+  && ok "harness apply: three packs adopted" || ko "harness apply failed"
+grep -q 'loop-pack: backend-clean-arch/rules' "$pw/skills/RULES.md" 2>/dev/null \
+  && grep -q 'loop-pack: frontend-humble-object/worker' "$pw/CLAUDE.worker.local.md" 2>/dev/null \
+  && ok "harness: L1 snippets appended with markers" || ko "harness: L1 snippets missing"
+[ -x "$pw/worker-harness.d/backend-clean-arch-guard-layer-imports" ] \
+  && [ -x "$pw/worker-harness.d/frontend-humble-object-guard-no-e2e" ] \
+  && ok "harness: L2 guards installed executable" || ko "harness: L2 guards missing"
+[ -f "$pw/gate.d/backend-clean-arch-10-layer-deps.sh" ] \
+  && [ -f "$pw/gate.d/frontend-humble-object-20-no-e2e.sh" ] \
+  && ok "harness: L3 gate.d checks installed" || ko "harness: L3 checks missing"
+[ -f "$pw/gate.d/clean-arch.env" ] && [ -f "$pw/gate.d/frontend-testing.env" ] \
+  && ok "harness: config templates placed in gate.d/ (no-clobber)" || ko "harness: configs missing"
+[ -f "$pw/memory/ontology/README.md" ] && [ -f "$pw/memory/ontology/forms.md" ] \
+  && ok "harness: ontology scaffold placed" || ko "harness: ontology scaffold missing"
+hns apply backend-clean-arch >/dev/null 2>&1
+[ "$(grep -c 'loop-pack: backend-clean-arch/rules' "$pw/skills/RULES.md")" = 1 ] \
+  && ok "harness apply: idempotent (marker prevents duplicate append)" \
+  || ko "harness apply duplicated snippets"
+grep -q 'adopted pack: backend-clean-arch' "$pw/memory/PROGRESS.md" 2>/dev/null \
+  && ok "harness: HARNESS_PACK event logged to PROGRESS" || ko "harness: PROGRESS event missing"
+
+echo "== pack guards + gate.d checks (pack contract) =="
+# guard-no-e2e: default config blocks e2e paths and runners, allows normal work.
+GNE="$pw/worker-harness.d/frontend-humble-object-guard-no-e2e"
+gne() { # <desc> <expected> <json>
+  local desc="$1" exp="$2" json="$3" rc
+  printf '%s' "$json" | HARNESS_WORKTREE=/wt bash "$GNE" >/dev/null 2>&1; rc=$?
+  [ "$rc" = "$exp" ] && ok "guard-no-e2e $desc (exit $rc)" || ko "guard-no-e2e $desc: expected $exp got $rc"
+}
+gne "block e2e/ dir file"        2 '{"tool_name":"Write","tool_input":{"file_path":"/wt/e2e/login.spec.ts"}}'
+gne "block *.cy.ts"              2 '{"tool_name":"Write","tool_input":{"file_path":"/wt/src/login.cy.ts"}}'
+gne "block playwright.config"    2 '{"tool_name":"Write","tool_input":{"file_path":"/wt/playwright.config.ts"}}'
+gne "allow unit spec"            0 '{"tool_name":"Write","tool_input":{"file_path":"/wt/src/login.spec.ts"}}'
+gne "block cypress run (Bash)"   2 '{"tool_name":"Bash","tool_input":{"command":"npx cypress run"}}'
+gne "allow npm test (Bash)"      0 '{"tool_name":"Bash","tool_input":{"command":"npm test"}}'
+# guard-layer-imports: unconfigured -> allow; configured -> block outward import in core.
+GLI="$pw/worker-harness.d/backend-clean-arch-guard-layer-imports"
+CORE_JSON='{"tool_name":"Write","tool_input":{"file_path":"/wt/src/domain/user.ts","content":"import pg from \"pg\""}}'
+printf '%s' "$CORE_JSON" | HARNESS_WORKTREE=/wt bash "$GLI" >/dev/null 2>&1; rc=$?
+[ "$rc" = 0 ] && ok "guard-layer-imports: unconfigured pack is advisory (exit 0)" \
+             || ko "guard-layer-imports unconfigured: expected 0 got $rc"
+cat > "$pw/gate.d/clean-arch.env" <<'EOF'
+CORE_DIRS="src/domain/"
+FORBIDDEN_IMPORT_REGEX="from ['\"](pg|express)"
+EOF
+printf '%s' "$CORE_JSON" | HARNESS_WORKTREE=/wt bash "$GLI" >/dev/null 2>&1; rc=$?
+[ "$rc" = 2 ] && ok "guard-layer-imports: outward import into core blocked (exit 2)" \
+             || ko "guard-layer-imports block: expected 2 got $rc"
+printf '%s' '{"tool_name":"Write","tool_input":{"file_path":"/wt/src/adapters/db.ts","content":"import pg from \"pg\""}}' \
+  | HARNESS_WORKTREE=/wt bash "$GLI" >/dev/null 2>&1; rc=$?
+[ "$rc" = 0 ] && ok "guard-layer-imports: adapters may import infra (exit 0)" \
+             || ko "guard-layer-imports adapter: expected 0 got $rc"
+# L3 twins on a fixture repo (cwd = tree, GATE_* env contract).
+lr="$(mktemp -d)"
+git -C "$lr" init -q -b main; ( cd "$lr" && git config user.email a@b && git config user.name a \
+  && mkdir -p src/domain && echo 'clean' > src/domain/user.ts && git add -A && git commit -qm base \
+  && git checkout -qb work/w1 && printf 'import pg from "pg"\n' >> src/domain/user.ts \
+  && mkdir e2e && echo spec > e2e/x.spec.ts && git add -A && git commit -qm change )
+mb="$(git -C "$lr" merge-base main work/w1)"
+( cd "$lr" && GATE_MERGE_BASE="$mb" GATE_BRANCH=work/w1 bash "$pw/gate.d/backend-clean-arch-10-layer-deps.sh" ) >/dev/null 2>&1; rc=$?
+[ "$rc" = 1 ] && ok "10-layer-deps: added outward core import fails the gate" \
+             || ko "10-layer-deps: expected 1 got $rc"
+( cd "$lr" && GATE_MERGE_BASE="$mb" GATE_BRANCH=work/w1 bash "$pw/gate.d/frontend-humble-object-20-no-e2e.sh" ) >/dev/null 2>&1; rc=$?
+[ "$rc" = 1 ] && ok "20-no-e2e: added e2e/ file fails the gate" \
+             || ko "20-no-e2e: expected 1 got $rc"
+rm -rf "$lr" "$pw"
+
+echo "== design SSOT direct-read (plan.sh wiring) =="
+# The planner must be pointed at the typed-design tree ITSELF (no exported bundle, no cached
+# copy): DESIGN_SSOT_DIR when set, else <repo>/atlas auto-detection.
+grep -q 'DESIGN_SSOT_DIR' "$CTL/plan.sh" && grep -q 'repo/atlas' "$CTL/plan.sh" \
+  && ok "plan.sh: DESIGN_SSOT_DIR honored + in-repo atlas/ auto-detected" \
+  || ko "plan.sh: design SSOT direct-read wiring missing"
+grep -q 'AUTHORITATIVE' "$CTL/plan.sh" \
+  && ok "plan.sh: design contracts framed as authoritative over implementation" \
+  || ko "plan.sh: authority framing missing"
+grep -q 'DESIGN_SSOT_DIR' "$CTL/config.env" && grep -q 'DESIGN_SSOT_DIR' "$CTL/lib.sh" \
+  && ok "config: DESIGN_SSOT_DIR knob documented with a lib default" \
+  || ko "config: DESIGN_SSOT_DIR knob missing"
+
+echo "== planner + engine wiring (static contracts) =="
+grep -q 'ontology/digest.md' "$CTL/plan.sh" \
+  && ok "plan.sh: planner reads the ontology digest when present" \
+  || ko "plan.sh: digest read missing"
+grep -q 'F2P' "$CTL/plan.sh" && grep -q 'P2P' "$CTL/plan.sh" \
+  && ok "plan.sh: contract tests carry the F2P/P2P framing" \
+  || ko "plan.sh: F2P/P2P framing missing"
+grep -q 'F2P' "$CTL/verify.sh" \
+  && ok "verify.sh: feedback explains F2P vs P2P failures" \
+  || ko "verify.sh: F2P/P2P explanation missing"
+grep -q 'not evidence' "$CTL/second-opinion.sh" \
+  && ok "second-opinion: judge told to ignore provenance/self-assessment cues" \
+  || ko "second-opinion: bias-hygiene instruction missing"
+if grep -qi 'another AI wrote' "$CTL/second-opinion.sh"; then
+  ko "second-opinion: provenance cue still present in the judge prompt"
+else ok "second-opinion: no provenance cue in the judge prompt"; fi
+grep -q 'escalation_report' "$CTL/loop.sh" \
+  && ok "loop.sh: escalation writes the co-evolution review packet" \
+  || ko "loop.sh: escalation_report not wired"
 
 echo
 echo "tests-toolkit: $pass passed, $fail failed."

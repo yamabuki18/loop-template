@@ -46,6 +46,8 @@ BACKLOG="$MEMORY_DIR/backlog.md"
 [ -f "$BACKLOG" ] || printf '# Backlog\n\n' > "$BACKLOG"
 printf -- '- [ ] %s (plan: memory/plans/%s)\n' "$TITLE" "$(basename "$dest")" >> "$BACKLOG"
 progress_log HANDOFF "-" "-" "$TITLE -> $(basename "$dest")"
+# A handoff is a human-approved preference over alternatives — record it as a PA node.
+ontology_event PA handoff "plan:$(basename "$dest")" "goal:$slug" "$TITLE"
 
 echo "handoff: plan archived  -> $dest"
 echo "handoff: goal queued    -> $BACKLOG"

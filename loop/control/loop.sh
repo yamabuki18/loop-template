@@ -185,6 +185,8 @@ while true; do
           if [ "${ROUNDS[$w]}" -gt "${MAX_FEEDBACK_ROUNDS:-4}" ]; then
             echo "loop: ESCALATE $w (${SLICE[$w]}) — stalled past the watchdog and ${MAX_FEEDBACK_ROUNDS} rounds."
             progress_log ESCALATED "$w" "work/$w" "${SLICE[$w]} (stalled >${MAX_FEEDBACK_ROUNDS} rounds)"
+            # Verifier co-evolution seam: frame BOTH hypotheses (bad worker vs bad gate) for the human.
+            if rp="$(escalation_report "$w" "${SLICE[$w]}" "${ROUNDS[$w]}")"; then [ -n "$rp" ] && echo "loop: review packet -> $rp"; fi
             notify "needs human: ${SLICE[$w]} on $w stalled"
             BUSY["$w"]=0; SLICE["$w"]=""; ROUNDS["$w"]=0
             ACTIVE_REMAINING=$((ACTIVE_REMAINING-1))
@@ -233,6 +235,8 @@ while true; do
       if [ "${ROUNDS[$w]}" -gt "${MAX_FEEDBACK_ROUNDS:-4}" ]; then
         echo "loop: ESCALATE $w (${SLICE[$w]}) — exceeded ${MAX_FEEDBACK_ROUNDS} rounds."
         progress_log ESCALATED "$w" "work/$w" "${SLICE[$w]} (>${MAX_FEEDBACK_ROUNDS} rounds, $(slice_stats "$w") elapsed=$(( $(date +%s) - ${START[$w]:-0} ))s)"
+        # Verifier co-evolution seam: frame BOTH hypotheses (bad worker vs bad gate) for the human.
+        if rp="$(escalation_report "$w" "${SLICE[$w]}" "${ROUNDS[$w]}")"; then [ -n "$rp" ] && echo "loop: review packet -> $rp"; fi
         notify "needs human: ${SLICE[$w]} on $w stuck"
         BUSY["$w"]=0; SLICE["$w"]=""; ROUNDS["$w"]=0
         ACTIVE_REMAINING=$((ACTIVE_REMAINING-1))

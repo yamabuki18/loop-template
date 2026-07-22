@@ -85,6 +85,8 @@ init: workspace ready. Next, in $WS:
   2. claude setup-token && loop secrets init && loop secrets edit worker
      -> the credential lives sops-encrypted (never a plaintext file)
   3. \$EDITOR skills/VISION.md skills/ARCHITECTURE.md skills/RULES.md
-  4. loop setup ${REPO:+$REPO}          (creates canonical — no image build in v3)
-  5. write goals in memory/backlog.md, then:  loop up
+  4. loop harness                       (optional: adopt methodology packs into the harness/
+     gate; keeping a typed design SSOT? point DESIGN_SSOT_DIR at it in config.env)
+  5. loop setup ${REPO:+$REPO}          (creates canonical — no image build in v3)
+  6. write goals in memory/backlog.md, then:  loop up
 EOF

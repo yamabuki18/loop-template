@@ -13,6 +13,9 @@
 #   loop init <dir> [repo-url]   create a standalone workspace directory instead of attaching
 #   loop secrets <sub>           manage sops-encrypted secrets: init | edit <scope> | status |
 #                                migrate --yes   (scopes: worker / gate / codex)
+#   loop harness [sub]           adopt methodology packs into this workspace's harness/gate:
+#                                wizard (default) | list | apply <pack>... | status
+#                                (packs = L1 snippets + L2 guards + L3 gate.d checks)
 #   loop supervise               interactive supervision: YOU + a strong Claude (SUPERVISOR_MODEL)
 #                                assign/verify/land in dialogue; cheap workers (WORKER_MODEL)
 #                                implement in parallel; watch.sh auto-gates every commit burst
@@ -32,7 +35,7 @@ ENGINE="$(cd "$(dirname "$SELF")/.." && pwd)"
 CTL="$ENGINE/control"
 
 usage() {
-  sed -n '2,27p' "$SELF" | sed 's/^# \{0,1\}//'
+  sed -n '2,30p' "$SELF" | sed 's/^# \{0,1\}//'
   echo
   echo "engine: $ENGINE (v$(cat "$ENGINE/VERSION" 2>/dev/null || echo '?'))"
 }

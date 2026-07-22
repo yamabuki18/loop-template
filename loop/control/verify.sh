@@ -62,11 +62,17 @@ if [ "$rc" -eq 0 ]; then
 fi
 
 # Route the failure back to the worker (workers don't run tests; they only get results).
+# Record the conflict in the event ontology (best-effort; rc-0 contract).
+ontology_event CA gate-fail "gate:$TASK exit $rc" "task:$TASK" "$BRANCH failed acceptance"
 {
   echo "# Supervisor test feedback — $TASK ($BRANCH)"
   echo "# The supervisor ran the acceptance tests on your COMMITTED branch and they FAILED (exit $rc)."
   echo "# Fix the issues below, then commit. The supervisor will re-verify."
   echo "# This file is transient (out-of-tree); you may delete it once addressed."
+  echo "# How to read failures (F2P/P2P): failures in YOUR slice's contract tests (tests/, named"
+  echo "# in your task brief) are F2P — the spec you must newly satisfy. Failures in anything"
+  echo "# that passed before your change are P2P regressions YOU introduced — fix those first,"
+  echo "# and never by weakening a test."
   echo
   # Distill long gate logs (FEEDBACK_MAX_LINES): a full `npm ci` transcript buries the actual
   # failure and pollutes the worker's context. Keep the head (what the gate ran) and the tail

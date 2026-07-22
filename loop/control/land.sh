@@ -34,6 +34,11 @@ echo "merged $BRANCH into $BASE_BRANCH (canonical)."
 # This slice's codex-round budget is spent state — reset it for the next assignment.
 codex_rounds_reset "$TASK"
 
+# Record the acceptance in the event ontology (PA node closes this task's open CA nodes in the
+# digest) and refresh the planner-readable digest. Both best-effort, rc-0 contract.
+ontology_event PA landed "gate:$TASK pass" "task:$TASK" "merged $BRANCH into $BASE_BRANCH"
+ontology_digest_refresh
+
 # Refresh the planner's structural map from the NEW base (deterministic, tokenless), so the
 # next DISCOVER/PLAN cycle sees the code that just landed without re-exploring the repo.
 repo_map_refresh

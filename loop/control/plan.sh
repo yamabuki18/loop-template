@@ -40,6 +40,34 @@ if ! secret_present worker && [ -f "$HOME/.claude/.credentials.json" ]; then
   chmod 600 "$PLAN_DIR/cfg/.credentials.json" 2>/dev/null || true
 fi
 
+# Design SSOT direct-read: when the project's design lives as TYPED DATA (e.g. a Spec Atlas
+# atlas/ tree — Lean sources under Domain/=vocabulary+types, Spec/=the design data), the
+# planner reads that tree DIRECTLY — no exported bundle, no cached copy to rot. Resolution:
+# DESIGN_SSOT_DIR from config.env (absolute path, e.g. an external design repo's atlas/),
+# else auto-detect atlas/ inside the repo. Ontology digest: unresolved CA conflicts from past
+# cycles (gate FAILs / codex concerns newer than the last acceptance) the plan must not repeat.
+DESIGN_READ=""
+design_dir=""
+if [ -n "${DESIGN_SSOT_DIR:-}" ] && [ -d "${DESIGN_SSOT_DIR:-}" ]; then
+  design_dir="$DESIGN_SSOT_DIR"
+elif [ -d "$PLAN_DIR/repo/atlas" ]; then
+  design_dir="$PLAN_DIR/repo/atlas"
+fi
+if [ -n "$design_dir" ]; then
+  DESIGN_READ="- $design_dir — the project's DESIGN SSOT kept as typed data. Read it DIRECTLY: start
+  with the vocabulary/type definitions (e.g. Domain/), then open ONLY the spec entries relevant
+  to this goal (e.g. Spec/). Treat its entities, ports and IO contracts as AUTHORITATIVE: slice
+  briefs must implement these contracts, never contradict or re-design them. If the design
+  seems wrong, note it in the brief for escalation — design changes happen in the design repo,
+  not here.
+"
+fi
+if [ -f "$MEMORY_DIR/ontology/digest.md" ]; then
+  DESIGN_READ+="- $MEMORY_DIR/ontology/digest.md — open conflicts (auto-derived from loop events): recent gate
+  failures and reviewer concerns not yet superseded by an acceptance. Do not re-plan into them.
+"
+fi
+
 # Scoped LLM-wiki fragments (WIKI_ENABLED): the planner reads the wiki BEFORE exploring code,
 # and makes each slice own its wiki/modules/ page so the worker keeps it fresh as part of DONE.
 WIKI_READ=""; WIKI_RULE=""
@@ -70,7 +98,7 @@ Read these first:
 - $SKILLS_DIR/VISION.md, $SKILLS_DIR/ARCHITECTURE.md, $SKILLS_DIR/RULES.md  (project intent, structure, rules)
 - $MEMORY_DIR/REPO_MAP.md  (auto-generated directory map with file counts — trust it and only
   explore the repo where the map is not enough)
-${WIKI_READ}- $MEMORY_DIR/PROGRESS.md  (what already landed / failed — do NOT re-plan finished work)
+${DESIGN_READ}${WIKI_READ}- $MEMORY_DIR/PROGRESS.md  (what already landed / failed — do NOT re-plan finished work)
 - the codebase in your working directory ($PLAN_DIR/repo) — treat it as READ-ONLY
 
 Then produce, under $PLAN_DIR/out:
@@ -91,6 +119,9 @@ ${WIKI_RULE}   - Fewer, cleanly-separated slices beat many overlapping ones. 1 s
    for each slice. Mirror the project's existing test layout and framework (infer from the repo
    and ARCHITECTURE.md). These become the gate the workers must pass. Keep them small and sharp:
    they are the spec, not an exhaustive suite. Reference each slice by name in a comment.
+   Mark each file with a "F2P" comment (fail-to-pass: it MUST fail on the current base and pass
+   once the slice is done — if it already passes, it specifies nothing). The rest of the suite
+   is the P2P (pass-to-pass) regression net; never weaken it to make room for a slice.
 
 Write ONLY under $PLAN_DIR/out. Do not modify the repo. When done, stop.
 EOF

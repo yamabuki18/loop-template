@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# PreToolUse guard (L2, pack: backend-clean-arch) — block edits that introduce a
+# forbidden outward dependency into a CORE directory, at the moment the worker writes them.
+# Same contract as the engine guards: JSON on stdin, exit 0 = allow / 2 = block (stderr shown
+# to the worker). Deterministic; fails CLOSED without jq (spawn.sh preflights jq anyway).
+# Configuration: gate.d/clean-arch.env in the workspace (CORE_DIRS / FORBIDDEN_IMPORT_REGEX)
+# — the same file the L3 gate check reads, so guard and gate can never disagree on the rules.
+# Unconfigured -> allow everything (the pack is advisory until tuned).
+set -uo pipefail
+
+CFG="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/gate.d/clean-arch.env"
+CORE_DIRS=""; FORBIDDEN_IMPORT_REGEX=""
+# shellcheck disable=SC1090
+[ -f "$CFG" ] && source "$CFG"
+[ -n "$CORE_DIRS" ] && [ -n "$FORBIDDEN_IMPORT_REGEX" ] || exit 0
+
+command -v jq >/dev/null 2>&1 || { echo "HARNESS: jq missing — denying to stay fail-closed." >&2; exit 2; }
+payload="$(cat)"
+tool="$(jq -r '.tool_name // ""' <<<"$payload" 2>/dev/null)" || exit 2
+case "$tool" in Edit|Write|NotebookEdit) ;; *) exit 0 ;; esac
+
+file="$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<<"$payload" 2>/dev/null)"
+[ -n "$file" ] || exit 0
+rel="${file#"${HARNESS_WORKTREE:-}/"}"
+
+in_core=0
+for d in $CORE_DIRS; do
+  case "$rel" in "$d"*) in_core=1; break ;; esac
+done
+[ "$in_core" = 1 ] || exit 0
+
+content="$(jq -r '.tool_input.content // .tool_input.new_string // .tool_input.new_source // ""' <<<"$payload" 2>/dev/null)"
+if printf '%s' "$content" | grep -qE "$FORBIDDEN_IMPORT_REGEX"; then
+  echo "HARNESS (backend-clean-arch): '$rel' is CORE — it must not depend outward (matched: $FORBIDDEN_IMPORT_REGEX). Define a port (interface) in core and implement it in an adapter instead. The gate re-checks this on the merged tree, so working around this hook only delays the failure." >&2
+  exit 2
+fi
+exit 0
