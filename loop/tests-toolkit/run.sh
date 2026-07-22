@@ -987,6 +987,110 @@ grep -q 'DESIGN_SSOT_DIR' "$CTL/config.env" && grep -q 'DESIGN_SSOT_DIR' "$CTL/l
   && ok "config: DESIGN_SSOT_DIR knob documented with a lib default" \
   || ko "config: DESIGN_SSOT_DIR knob missing"
 
+echo "== lib: usage guard (pure decisions) =="
+uw="$(mktemp -d)"; touch "$uw/.loop-workspace"
+ud() { # <desc> <expected> <five> <seven> [env pairs...]
+  local desc="$1" exp="$2" f="$3" s="$4"; shift 4
+  local out
+  out="$( export LOOP_PROJECT="$uw" USAGE_GUARD=1 "$@"
+          source "$CTL/lib.sh"; usage_guard_decision "$f" "$s" )"
+  [ "$out" = "$exp" ] && ok "usage_guard_decision $desc ($out)" || ko "usage_guard_decision $desc: expected $exp got $out"
+}
+ud "below thresholds -> ok"        ok    50  50
+ud "5h at 80 -> drain"             drain 80  10
+ud "7d at 95 -> drain"             drain 10  95
+ud "5h at 100 -> halt"             halt  100 10
+ud "7d at 100 -> halt"             halt  10  100
+ud "probe broken (none) -> ok"     ok    none none
+ud "custom pause pct honored"      drain 60  10 USAGE_PAUSE_PCT=60
+out="$( export LOOP_PROJECT="$uw" USAGE_GUARD=0; source "$CTL/lib.sh"; usage_guard_decision 100 100 )"
+[ "$out" = ok ] && ok "usage_guard_decision: guard off -> always ok" || ko "guard off: got $out"
+out="$( export LOOP_PROJECT="$uw" USAGE_GUARD=1; source "$CTL/lib.sh"; usage_pause_target 85 1000 10 2000 )"
+[ "$out" = 1000 ] && ok "usage_pause_target: only the tripped window counts" || ko "pause_target: got $out"
+out="$( export LOOP_PROJECT="$uw" USAGE_GUARD=1; source "$CTL/lib.sh"; usage_pause_target 85 1000 96 2000 )"
+[ "$out" = 2000 ] && ok "usage_pause_target: latest tripped reset wins (weekly)" || ko "pause_target weekly: got $out"
+out="$( export LOOP_PROJECT="$uw" USAGE_GUARD=1; source "$CTL/lib.sh"; usage_pause_target 10 1000 10 2000 )"
+[ "$out" = 0 ] && ok "usage_pause_target: nothing tripped -> 0" || ko "pause_target none: got $out"
+out="$( export LOOP_PROJECT="$uw" USAGE_RESUME_MARGIN_SECS=90; source "$CTL/lib.sh"; usage_wait_secs 1100 1000 )"
+[ "$out" = 190 ] && ok "usage_wait_secs: delta + margin" || ko "wait_secs: got $out"
+out="$( export LOOP_PROJECT="$uw" USAGE_RESUME_MARGIN_SECS=90; source "$CTL/lib.sh"; usage_wait_secs 500 1000 )"
+[ "$out" = 90 ] && ok "usage_wait_secs: past reset -> margin only" || ko "wait_secs past: got $out"
+
+echo "== lib: usage_probe (OAuth endpoint contract, shimmed) =="
+ubin="$(mktemp -d)"
+cat > "$ubin/curl" <<'SHIM'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "${FAKE_CURL_CAPTURE:-/dev/null}"
+[ "${FAKE_CURL_RC:-0}" != 0 ] && exit "${FAKE_CURL_RC}"
+printf '%s' "${FAKE_CURL_BODY:-}"
+SHIM
+chmod +x "$ubin/curl"
+cat > "$ubin/sops" <<'SHIM'
+#!/usr/bin/env bash
+if [ "$1" = "exec-env" ]; then f="$2"; cmd="$3"; set -a; . "$f"; set +a; exec sh -c "$cmd"; fi
+exit 0
+SHIM
+chmod +x "$ubin/sops"
+printf 'CLAUDE_CODE_OAUTH_TOKEN=tok123\n' > "$uw/secret.worker.sops.env"
+UBODY='{"five_hour":{"utilization":42.0,"resets_at":"2026-02-06T22:00:00+00:00"},"seven_day":{"utilization":14.4,"resets_at":"2026-02-12T20:00:00+00:00"}}'
+exp_fr="$(date -u -d '2026-02-06T22:00:00+00:00' +%s)"
+exp_sr="$(date -u -d '2026-02-12T20:00:00+00:00' +%s)"
+out="$( export LOOP_PROJECT="$uw" PATH="$ubin:$PATH" FAKE_CURL_BODY="$UBODY" FAKE_CURL_CAPTURE="$uw/curl.cap"
+        source "$CTL/lib.sh"; usage_probe )"
+[ "$out" = "42 $exp_fr 14 $exp_sr" ] \
+  && ok "usage_probe: parses utilization + ISO resets_at -> '42 <epoch> 14 <epoch>'" \
+  || ko "usage_probe: got '$out' (want '42 $exp_fr 14 $exp_sr')"
+if grep -q 'Bearer tok123' "$uw/curl.cap" && grep -q 'anthropic-beta: oauth-2025-04-20' "$uw/curl.cap" \
+   && grep -q 'claude-code/' "$uw/curl.cap" && grep -q 'api.anthropic.com/api/oauth/usage' "$uw/curl.cap"; then
+  ok "usage_probe: token via secret_exec + mandatory beta/User-Agent headers"
+else ko "usage_probe: request shape wrong ($(tr '\n' ' ' < "$uw/curl.cap" 2>/dev/null | head -c 200))"; fi
+out="$( export LOOP_PROJECT="$uw" PATH="$ubin:$PATH" FAKE_CURL_RC=22
+        source "$CTL/lib.sh"; usage_probe )"
+[ "$out" = none ] && ok "usage_probe: curl failure -> none (fail-open)" || ko "usage_probe fail: got '$out'"
+out="$( export LOOP_PROJECT="$uw" PATH="$ubin:$PATH" FAKE_CURL_BODY='not json'
+        source "$CTL/lib.sh"; usage_probe )"
+[ "$out" = none ] && ok "usage_probe: garbage body -> none" || ko "usage_probe garbage: got '$out'"
+out="$( export LOOP_PROJECT="$uw" USAGE_PROBE_CMD='echo "81 123 10 456"'
+        source "$CTL/lib.sh"; usage_probe )"
+[ "$out" = "81 123 10 456" ] && ok "usage_probe: USAGE_PROBE_CMD override honored" || ko "probe override: got '$out'"
+# usage_status caching: within USAGE_POLL_SECS the cache answers, no live probe.
+cnt="$uw/probe.count"; : > "$cnt"
+out="$( export LOOP_PROJECT="$uw" USAGE_POLL_SECS=3600 USAGE_PROBE_CMD='echo p >> '"$cnt"'; echo "50 1 50 2"'
+        source "$CTL/lib.sh"; usage_status >/dev/null; usage_status )"
+if [ "$out" = "50 1 50 2" ] && [ "$(wc -l < "$cnt")" = 1 ]; then
+  ok "usage_status: cached within USAGE_POLL_SECS (1 live probe for 2 reads)"
+else ko "usage_status cache: out='$out' probes=$(wc -l < "$cnt")"; fi
+rm -rf "$ubin"
+
+echo "== loop.sh usage guard (pause/resume integration) =="
+lw="$(mktemp -d)"; mkdir -p "$lw/ws" "$lw/home"
+touch "$lw/ws/.loop-workspace"
+mkdir -p "$lw/ws/canonical"; git -C "$lw/ws/canonical" init -q -b main
+git -C "$lw/ws/canonical" -c user.email=a@b -c user.name=a commit -q --allow-empty -m init
+printf '# Backlog\n\n- [ ] some goal\n' > "$lw/ws/memory/backlog.md" 2>/dev/null || { mkdir -p "$lw/ws/memory"; printf '# Backlog\n\n- [ ] some goal\n' > "$lw/ws/memory/backlog.md"; }
+out="$( export LOOP_PROJECT="$lw/ws" HOME="$lw/home" CLAUDE_CODE_OAUTH_TOKEN=dummy WORKER_COUNT=1 \
+               USAGE_GUARD=1 USAGE_PROBE_CMD='echo "100 0 100 0"' USAGE_POLL_SECS=1 USAGE_RESUME_MARGIN_SECS=1
+        timeout 6 bash "$CTL/loop.sh" 2>&1 )" || true
+if printf '%s' "$out" | grep -q 'USAGE PAUSE' && grep -q $'\tUSAGE_PAUSE\t' "$lw/ws/memory/PROGRESS.md" 2>/dev/null; then
+  ok "loop: hard-limited probe pauses before planning (USAGE_PAUSE logged)"
+else ko "loop usage pause: not triggered ($(printf '%s' "$out" | tail -3 | tr '\n' ' '))"; fi
+if ! printf '%s' "$out" | grep -q 'next goal'; then
+  ok "loop: no goal planned while hard-limited (tokens protected)"
+else ko "loop: planned a goal despite hard limit"; fi
+# ok path in a FRESH workspace (a paused run above leaves a poisoned usage.cache behind —
+# sharing it here would test cache reuse, not the ok path).
+mkdir -p "$lw/ws2/memory" "$lw/ws2/canonical"; touch "$lw/ws2/.loop-workspace"
+git -C "$lw/ws2/canonical" init -q -b main
+git -C "$lw/ws2/canonical" -c user.email=a@b -c user.name=a commit -q --allow-empty -m init
+printf '# Backlog\n' > "$lw/ws2/memory/backlog.md"
+out="$( export LOOP_PROJECT="$lw/ws2" HOME="$lw/home" CLAUDE_CODE_OAUTH_TOKEN=dummy WORKER_COUNT=1 \
+               USAGE_GUARD=1 USAGE_PROBE_CMD='echo "10 0 5 0"' USAGE_POLL_SECS=3600
+        timeout 10 bash "$CTL/loop.sh" 2>&1 )"; rc=$?
+if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'DONE'; then
+  ok "loop: guard ok-path leaves the normal flow untouched (empty backlog -> DONE)"
+else ko "loop guard ok-path: rc=$rc ($(printf '%s' "$out" | tail -2 | tr '\n' ' '))"; fi
+rm -rf "$lw"
+
 echo "== planner + engine wiring (static contracts) =="
 grep -q 'ontology/digest.md' "$CTL/plan.sh" \
   && ok "plan.sh: planner reads the ontology digest when present" \
@@ -1006,6 +1110,12 @@ else ok "second-opinion: no provenance cue in the judge prompt"; fi
 grep -q 'escalation_report' "$CTL/loop.sh" \
   && ok "loop.sh: escalation writes the co-evolution review packet" \
   || ko "loop.sh: escalation_report not wired"
+grep -q 'USAGE_DRAIN" = 0 \] && \[ "${#QUEUE\[@\]}" -gt 0' "$CTL/loop.sh" \
+  && ok "loop.sh: ASSIGN suspended while draining" \
+  || ko "loop.sh: drain does not gate ASSIGN"
+grep -q 'usage_pause "worker stall coincides' "$CTL/loop.sh" \
+  && ok "loop.sh: watchdog pauses (not respawns) when the window is exhausted" \
+  || ko "loop.sh: watchdog usage interception missing"
 
 echo
 echo "tests-toolkit: $pass passed, $fail failed."

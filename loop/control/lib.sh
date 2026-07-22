@@ -116,6 +116,17 @@ if [ -f "$CONFIG_DIR/config.env" ]; then source "$CONFIG_DIR/config.env"; fi
 # (no new commit) for at least this many seconds. 0 = heuristic off (pre-3.3 behavior: rebase any
 # non-'working' worker). The config template turns it on.
 : "${SYNC_IDLE_SECS:=0}"
+# Subscription usage guard (loop.sh): watch the Claude plan's rolling windows (5-hour session +
+# 7-day week) and pace the fleet — drain (finish in-flight slices, assign nothing new) past
+# USAGE_PAUSE_PCT, pause outright when hard-limited, auto-resume after the window resets.
+# Default OFF here so an older config keeps its exact behavior; the config template turns it on.
+: "${USAGE_GUARD:=0}"
+: "${USAGE_PAUSE_PCT:=80}"          # 5h window: drain at this utilization %
+: "${USAGE_WEEKLY_PAUSE_PCT:=95}"   # 7d window: drain at this utilization %
+: "${USAGE_HALT_PCT:=100}"          # either window: hard-limited -> pause immediately
+: "${USAGE_POLL_SECS:=300}"         # min seconds between probes (cached in state/usage.cache)
+: "${USAGE_RESUME_MARGIN_SECS:=90}" # resume this many seconds AFTER the reported reset
+: "${USAGE_PROBE_CMD:=}"            # override the probe (tests / other billing setups)
 # Archive a worker's Claude session transcript(s) to state/logs/<task>.session/ when it is
 # reaped/respawned (best-effort). Workers run in an interactive TUI so there is no --output-format
 # capture; this preserves the *.jsonl session logs so a stalled/derailed worker's reasoning can be
@@ -520,6 +531,122 @@ wiki_index_refresh() {
       done < <(find "$wdir" -name '*.md' ! -name 'index.md' | sort)
     done
   } > "$tmp" && mv "$tmp" "$wdir/index.md"
+}
+
+# --- subscription usage guard (Claude plan windows) ---------------------------------------------
+# The subscription bills against two rolling windows shared across every surface using the same
+# account (Claude Code, claude.ai, all workers here): a 5-hour session window and a 7-day week.
+# The ONLY programmatic source for their utilization is the OAuth usage endpoint that powers
+# Claude Code's /usage HUD: GET https://api.anthropic.com/api/oauth/usage with the Bearer token,
+# `anthropic-beta: oauth-2025-04-20` AND a `User-Agent: claude-code/<ver>` (mandatory — without
+# it the endpoint 429s persistently). It is UNDOCUMENTED and may change: every consumer here is
+# fail-open (a broken probe echoes 'none' and the guard decides 'ok'), so the loop can never be
+# stranded by a probe outage — at worst it degrades to pre-guard behavior.
+#
+# usage_probe — one probe, no cache. Prints ONE line, always rc 0:
+#   "<five_pct> <five_reset_epoch> <seven_pct> <seven_reset_epoch>"   (pct = integer 0-100+)
+# or "none" when anything fails. USAGE_PROBE_CMD overrides the whole probe (tests, other
+# billing setups); its stdout must follow the same contract.
+usage_probe() {
+  if [ -n "${USAGE_PROBE_CMD:-}" ]; then
+    bash -c "$USAGE_PROBE_CMD" 2>/dev/null || echo none
+    return 0
+  fi
+  command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || { echo none; return 0; }
+  # User-Agent must look like the real client; probe the installed version once per process.
+  if [ -z "${_USAGE_UA_CACHE:-}" ]; then
+    local v
+    v="$(claude --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)" || v=""
+    _USAGE_UA_CACHE="claude-code/${v:-2.1.0}"
+  fi
+  local fetch body=""
+  fetch='curl -sf --max-time 20 \
+    -H "Authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN" \
+    -H "anthropic-beta: oauth-2025-04-20" \
+    -H "User-Agent: '"$_USAGE_UA_CACHE"'" \
+    -H "Content-Type: application/json" \
+    https://api.anthropic.com/api/oauth/usage'
+  if secret_present worker; then
+    # The token stays inside the secret_exec child env — this shell never sees it.
+    if ! body="$(secret_exec worker -- sh -c "$fetch" 2>/dev/null)"; then body=""; fi
+  elif [ -f "$HOME/.claude/.credentials.json" ]; then
+    # Host-login mode: ride the operator's own credential (same tradeoff as spawn.sh). The
+    # access token expires ~hourly and is refreshed by any running claude — a stale token just
+    # means 'none' here (fail-open), never a stall.
+    if ! body="$(sh -c 'CLAUDE_CODE_OAUTH_TOKEN="$(jq -r ".claudeAiOauth.accessToken // empty" "$HOME/.claude/.credentials.json")" ; [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] && export CLAUDE_CODE_OAUTH_TOKEN && '"$fetch" 2>/dev/null)"; then body=""; fi
+  fi
+  [ -n "$body" ] || { echo none; return 0; }
+  local raw f fr s sr
+  if ! raw="$(jq -r '[(.five_hour.utilization // "x"), (.five_hour.resets_at // "x"),
+                      (.seven_day.utilization // "x"), (.seven_day.resets_at // "x")]
+                     | map(tostring) | join(" ")' <<<"$body" 2>/dev/null)"; then raw=""; fi
+  # shellcheck disable=SC2086  # word-split the 4 fields on purpose (ISO stamps have no spaces)
+  set -- $raw
+  [ $# -eq 4 ] || { echo none; return 0; }
+  f="$(_usage_pct "$1")"; fr="$(_usage_epoch "$2")"; s="$(_usage_pct "$3")"; sr="$(_usage_epoch "$4")"
+  [ "$f" = none ] && { echo none; return 0; }
+  echo "$f $fr $s $sr"
+}
+_usage_pct()   { case "${1:-}" in ''|*[!0-9.]*) echo none; return 0;; esac; LC_ALL=C printf '%.0f\n' "$1" 2>/dev/null || echo none; }
+_usage_epoch() { date -u -d "${1:-}" +%s 2>/dev/null || echo 0; }
+
+# usage_status — cached probe (state/usage.cache), at most one live probe per USAGE_POLL_SECS
+# (the endpoint rate-limits aggressively; community guidance is >=180s). Same output contract.
+usage_status() {
+  local cache="$STATE_DIR/usage.cache" now ts line
+  now="$(date +%s)"
+  if [ -f "$cache" ]; then
+    ts="$(head -1 "$cache" 2>/dev/null | awk '{print $1}')"
+    case "$ts" in *[!0-9]*|'') ts=0;; esac
+    if [ $((now - ts)) -lt "${USAGE_POLL_SECS:-300}" ]; then
+      line="$(head -1 "$cache" 2>/dev/null | cut -d' ' -f2-)"
+      [ -n "$line" ] && { echo "$line"; return 0; }
+    fi
+  fi
+  line="$(usage_probe)"
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  echo "$now $line" > "$cache" 2>/dev/null || true
+  echo "$line"
+}
+
+# usage_guard_decision <five_pct> <seven_pct> (PURE — unit-tested). Echoes ok | drain | halt.
+#   halt  = a window is hard-limited (>= USAGE_HALT_PCT): pause NOW, workers can't progress.
+#   drain = past the pause threshold: let in-flight slices finish, assign nothing new.
+#   ok    = below thresholds, guard off, or unparsable input (fail-open by design).
+usage_guard_decision() {
+  [ "${USAGE_GUARD:-0}" = 1 ] || { echo ok; return 0; }
+  local f="${1:-}" s="${2:-}"
+  case "$f" in ''|none|*[!0-9]*) echo ok; return 0;; esac
+  case "$s" in ''|none|*[!0-9]*) s=0;; esac
+  if [ "$f" -ge "${USAGE_HALT_PCT:-100}" ] || [ "$s" -ge "${USAGE_HALT_PCT:-100}" ]; then
+    echo halt; return 0
+  fi
+  if [ "$f" -ge "${USAGE_PAUSE_PCT:-80}" ] || [ "$s" -ge "${USAGE_WEEKLY_PAUSE_PCT:-95}" ]; then
+    echo drain; return 0
+  fi
+  echo ok
+}
+
+# usage_pause_target <five_pct> <five_reset> <seven_pct> <seven_reset> (PURE): epoch to resume
+# at — the LATEST reset among the windows that are over their threshold (waiting out only the
+# 5h window while the week is exhausted would thrash). 0 when none apply / unparsable.
+usage_pause_target() {
+  local f="${1:-none}" fr="${2:-0}" s="${3:-none}" sr="${4:-0}" t=0
+  case "$fr" in ''|*[!0-9]*) fr=0;; esac
+  case "$sr" in ''|*[!0-9]*) sr=0;; esac
+  case "$f" in ''|none|*[!0-9]*) ;; *) { [ "$f" -ge "${USAGE_PAUSE_PCT:-80}" ] || [ "$f" -ge "${USAGE_HALT_PCT:-100}" ]; } && t="$fr";; esac
+  case "$s" in ''|none|*[!0-9]*) ;; *) if [ "$s" -ge "${USAGE_WEEKLY_PAUSE_PCT:-95}" ] && [ "$sr" -gt "$t" ]; then t="$sr"; fi;; esac
+  echo "$t"
+}
+
+# usage_wait_secs <resume_target_epoch> <now_epoch> (PURE): seconds to sleep before re-probing.
+# Past/unknown target -> just the margin (re-probe soon); never negative.
+usage_wait_secs() {
+  local r="${1:-0}" n="${2:-0}" d
+  case "$r" in ''|*[!0-9]*) r=0;; esac
+  case "$n" in ''|*[!0-9]*) n=0;; esac
+  d=$((r - n)); [ "$d" -lt 0 ] && d=0
+  echo $((d + ${USAGE_RESUME_MARGIN_SECS:-90}))
 }
 
 # --- AIF event ontology (memory/ontology/) ------------------------------------------------------

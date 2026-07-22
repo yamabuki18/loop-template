@@ -425,6 +425,36 @@ herdr workspace <project>
   `wiki/index.md` は land のたびに frontmatter から bash が自動生成（0 トークン・衝突ゼロ）。
 - **PLAN_USAGE 計測** … 計画役 1 回ごとのトークン消費を `PROGRESS.md` に記録。
 
+### 使用量ガード（`USAGE_GUARD` — プランの窓を見ながら艦隊を運転する）
+
+Claude サブスクリプションの制限は**5 時間のローリング窓 + 7 日窓**の 2 本で、同一アカウントの
+全サーフェス（全ワーカー・claude.ai・手元の Claude Code）が**同じ窓を共有**する。だからペース
+配分はワーカーではなく**ループの仕事**。`USAGE_GUARD=1`（テンプレ既定）で loop.sh が毎サイクル:
+
+```
+利用率 < 80%           → 通常運転
+5h窓 ≥ USAGE_PAUSE_PCT → DRAIN: 進行中スライスは完走して land（トークンは既に沈没費用）、
+  (既定80%)               新規の計画・アサインは停止
+全員完了 or 100%到達    → PAUSE: resets_at + マージンまで停止（PROGRESS: USAGE_PAUSE + 通知）
+窓リセット後           → 自動再開トリガー: 生プローブで確認 → USAGE_RESUME + 通知 +
+                         進行中ワーカー全員へ nudge（「窓が回復した。続きを実装して commit」）
+```
+
+- **情報源**: Claude Code の `/usage` HUD と同じ OAuth 使用量エンドポイント
+  （`GET api.anthropic.com/api/oauth/usage`、worker スコープのトークンを `secret_exec` 経由で
+  注入 — ループのシェルは秘密を見ない）。**非公式 API** なのでガードは全経路 fail-open —
+  プローブが壊れたら「ガード無し」に縮退するだけで、ループは絶対に止まらない。
+- エンドポイント自体がレート制限されるため、プローブは `USAGE_POLL_SECS`（既定300s）で
+  キャッシュされ、`User-Agent: claude-code/<ver>` を必ず付ける（無いと恒常 429）。
+- **7 日窓**も監視する（`USAGE_WEEKLY_PAUSE_PCT`、既定95%）。こちらで止まると再開は数日後に
+  なりうる — 通知が飛ぶので気づける。100 にすれば「完全枯渇時のみ反応」。
+- **watchdog との干渉を解消済み**: リミット中のワーカーは「無進捗」に見えるが、respawn しても
+  何も変わらずラウンドを浪費するだけ。watchdog の respawn 直前に生プローブし、窓の枯渇が原因
+  なら respawn ではなく pause に切り替える（再開 nudge で同じセッションが文脈ごと続きから動く）。
+- 対象は loop.sh（完全自律）のみ。`loop supervise` / watch.sh は人間が居る前提なので対象外。
+- `USAGE_PROBE_CMD` でプローブを差し替え可能（テスト・API キー課金・独自モニタ連携用。
+  出力契約: `"<5h%> <5hリセットepoch> <7d%> <7dリセットepoch>"` または `none`）。
+
 ---
 
 ## 受け入れゲートを「効かせる」
@@ -511,7 +541,7 @@ frontmatter でいつ再評価すべきかを宣言している。**例外はセ
 ## ツールキット自体のテスト
 
 ```bash
-./tests-toolkit/run.sh          # bash -n / shellcheck(任意) / フック契約 / lib 単体（herdr 不要・283 ケース）
+./tests-toolkit/run.sh          # bash -n / shellcheck(任意) / フック契約 / lib 単体（herdr 不要・307 ケース）
 ./tests-toolkit/e2e-nocreds.sh  # gate/verify/land/sync の全経路 e2e（資格情報・herdr・Docker 全て不要）
 ```
 
@@ -645,3 +675,11 @@ LongCLI-Bench 等）のサーベイ結果をエンジンへ反映した。
     人手・LLM 維持ゼロ。land ごとに digest を再生成し、計画役が「未解決の対立」を既読。
     上位オントロジー制約は `ontology-check.sh` が決定論検証（`ONTOLOGY_ENABLED` で無効化可）。
 
+### v3.5 使用量ガード（サブスクリプションの窓に合わせた自動ペース配分）
+
+19. **`USAGE_GUARD`**: プラン共有の 5h/7d 窓を OAuth 使用量エンドポイント（/usage HUD と同源、
+    非公式のため fail-open）で監視し、80% で DRAIN（進行中は完走・新規停止）→ 全員完了か
+    100% 到達で PAUSE → 窓リセット後に自動再開トリガー（USAGE_RESUME + 通知 + 進行中ワーカー
+    へ nudge）。watchdog はリミット起因の停滞を respawn せず pause に切替（ラウンド浪費を防止）。
+    プローブはキャッシュ + 必須 User-Agent でエンドポイント側のレート制限を尊重。詳細は
+    「トークンバーンのガードレール > 使用量ガード」。

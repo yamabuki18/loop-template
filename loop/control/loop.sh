@@ -78,6 +78,48 @@ mark_goal() {  # mark_goal <x|~> <goal-text>  — flip that goal's checkbox in p
 free_worker() { for w in "${WORKERS[@]}"; do [ "${BUSY[$w]}" = 0 ] && { echo "$w"; return; }; done; }
 any_busy()    { for w in "${WORKERS[@]}"; do [ "${BUSY[$w]}" = 1 ] && return 0; done; return 1; }
 
+# --- subscription usage guard (USAGE_GUARD) ---
+# The plan's 5-hour/7-day windows are shared by every worker (same account), so pacing is a
+# LOOP concern, not a worker concern: past USAGE_PAUSE_PCT the loop drains (in-flight slices
+# finish and land — their tokens are already sunk — but nothing new is assigned); once nothing
+# is busy, or immediately when hard-limited, it pauses and auto-resumes after the window reset.
+USAGE_DRAIN=0
+U_F=none; U_FR=0; U_S=none; U_SR=0    # last probe: five/seven pct + reset epochs
+usage_refresh() { # cached probe -> U_* globals; echoes the decision (ok|drain|halt)
+  read -r U_F U_FR U_S U_SR <<<"$(usage_status)" || true
+  usage_guard_decision "${U_F:-none}" "${U_S:-none}"
+}
+usage_pause() { # <why> — sleep until the limiting window resets (re-probing), then resume
+  local why="$1" target now wait chunk
+  echo "loop: USAGE PAUSE — $why"
+  progress_log USAGE_PAUSE "-" "-" "$why (5h=${U_F}% 7d=${U_S}%)"
+  notify "usage pause: $why"
+  while :; do
+    target="$(usage_pause_target "$U_F" "$U_FR" "$U_S" "$U_SR")"
+    now="$(date +%s)"
+    # Unknown reset (probe degraded)? Re-probe on the poll cadence instead of spinning.
+    [ "${target:-0}" -gt 0 ] || target=$((now + ${USAGE_POLL_SECS:-300}))
+    wait="$(usage_wait_secs "$target" "$now")"
+    echo "loop: paused — resuming around $(date -d "@$((now + wait))" 2>/dev/null || echo "+${wait}s") (5h=${U_F}% 7d=${U_S}%)"
+    while [ "$wait" -gt 0 ]; do   # chunked so Ctrl-C stays responsive and logs show life
+      chunk=$(( wait > 60 ? 60 : wait )); sleep "$chunk"; wait=$((wait - chunk))
+    done
+    rm -f "$STATE_DIR/usage.cache" 2>/dev/null   # force a LIVE probe after the window reset
+    case "$(usage_refresh)" in ok) break;; esac  # still limited (weekly / stale reset) -> wait more
+  done
+  USAGE_DRAIN=0
+  echo "loop: USAGE RESUME — windows clear (5h=${U_F}% 7d=${U_S}%)."
+  progress_log USAGE_RESUME "-" "-" "5h=${U_F}% 7d=${U_S}%"
+  notify "usage window reset — loop resumed"
+  # Resume trigger for in-flight workers: their Claude sat at the limit error; nudge it back to
+  # work. Best-effort (herdr) — the stop-gate/feedback hooks still guarantee eventual delivery.
+  for w in "${WORKERS[@]}"; do
+    [ "${BUSY[$w]:-0}" = 1 ] || continue
+    agent_send "$w" "The usage window has reset — continue your task now. Read $(harness_dir "$w")/feedback.md if present, finish the slice and commit." || true
+    PROG["$w"]="$(date +%s)"; STALL["$w"]=0   # the pause was not a stall — reset the watchdog
+  done
+}
+
 # Crash reconciliation: a previous run may have died with a goal marked "- [~]" (in progress).
 # next_goal only picks "- [ ]", so reset orphaned "~" goals back to unstarted before we begin.
 if [ -f "$BACKLOG" ]; then
@@ -96,8 +138,32 @@ while true; do
     echo "loop: LOOP_MAX_CYCLES ($LOOP_MAX_CYCLES) reached — stopping."; break
   fi
 
+  # ── USAGE GUARD: pace the fleet against the plan's shared 5h/7d windows ──
+  if [ "${USAGE_GUARD:-0}" = 1 ]; then
+    case "$(usage_refresh)" in
+      halt)   # hard-limited: nobody can progress — pause immediately, resume after reset
+        usage_pause "hard-limited"
+        continue ;;
+      drain)
+        if any_busy; then
+          if [ "$USAGE_DRAIN" = 0 ]; then
+            echo "loop: usage 5h=${U_F}% 7d=${U_S}% — DRAINING (in-flight slices finish, nothing new starts)."
+            progress_log USAGE_DRAIN "-" "-" "5h=${U_F}% 7d=${U_S}%"
+            notify "usage ${U_F}% — draining before pause"
+          fi
+          USAGE_DRAIN=1
+        else
+          usage_pause "threshold reached with no in-flight work"
+          continue
+        fi ;;
+      ok)
+        [ "$USAGE_DRAIN" = 1 ] && echo "loop: usage back under threshold — drain lifted."
+        USAGE_DRAIN=0 ;;
+    esac
+  fi
+
   # ── DISCOVER/PLAN: only when the queue is empty AND nobody is busy (one goal at a time) ──
-  if [ "${#QUEUE[@]}" -eq 0 ] && ! any_busy; then
+  if [ "${#QUEUE[@]}" -eq 0 ] && ! any_busy && [ "$USAGE_DRAIN" = 0 ]; then
     [ "$ACTIVE_GOAL" ] && { mark_goal x "$ACTIVE_GOAL"; progress_log GOAL_DONE "-" "-" "$ACTIVE_GOAL"; notify "goal complete: $ACTIVE_GOAL"; ACTIVE_GOAL=""; }
     goal="$(next_goal || true)"
     if [ -z "$goal" ]; then
@@ -122,8 +188,8 @@ while true; do
     echo "loop: ${ACTIVE_REMAINING} slice(s) queued for goal."
   fi
 
-  # ── ASSIGN: give free workers the next queued slices ──
-  while [ "${#QUEUE[@]}" -gt 0 ]; do
+  # ── ASSIGN: give free workers the next queued slices (suspended while draining) ──
+  while [ "$USAGE_DRAIN" = 0 ] && [ "${#QUEUE[@]}" -gt 0 ]; do
     w="$(free_worker || true)"; [ -n "$w" ] || break
     slice="${QUEUE[0]}"; QUEUE=("${QUEUE[@]:1}")
     name="$(jq -r '.name' <<<"$slice")"
@@ -181,6 +247,17 @@ while true; do
           STALL["$w"]=1; PROG["$w"]="$now"
           continue ;;
         act)
+          # A worker that stalled because the ACCOUNT is limited is not a hung worker: nothing
+          # would change after a respawn except a burned feedback round. Re-probe live and
+          # pause instead — the resume nudge restarts the same session with its context intact.
+          if [ "${USAGE_GUARD:-0}" = 1 ]; then
+            rm -f "$STATE_DIR/usage.cache" 2>/dev/null
+            if [ "$(usage_refresh)" != ok ]; then
+              echo "loop: $w stalled but the usage window is exhausted (5h=${U_F}% 7d=${U_S}%) — pausing, not respawning."
+              usage_pause "worker stall coincides with an exhausted window"
+              continue
+            fi
+          fi
           ROUNDS["$w"]=$(( ROUNDS["$w"] + 1 ))
           if [ "${ROUNDS[$w]}" -gt "${MAX_FEEDBACK_ROUNDS:-4}" ]; then
             echo "loop: ESCALATE $w (${SLICE[$w]}) — stalled past the watchdog and ${MAX_FEEDBACK_ROUNDS} rounds."
