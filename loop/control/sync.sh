@@ -30,7 +30,6 @@ for TASK in "${tasks[@]}"; do
   ( source "$STATE_DIR/$TASK.env"
     WT="${WORKTREE:-$(worktree_for "$TASK")}"
     [ -e "$WT/.git" ] || { echo "sync: '$TASK' has no worktree (skipped)"; exit 0; }
-    HD="$(harness_dir "$TASK")"
 
     # Never rebase under a worker that is mid-burst — a moving worktree is how you corrupt work.
     # herdr is the primary signal but best-effort: when it can't report (server down, crashed
@@ -55,10 +54,9 @@ for TASK in "${tasks[@]}"; do
         fi ;;
     esac
     if ! git -C "$WT" diff --quiet 2>/dev/null || ! git -C "$WT" diff --cached --quiet 2>/dev/null; then
-      mkdir -p "$HD"
       { echo "# Rebase pending onto $BASE_BRANCH — you have uncommitted changes."
         echo "Commit them (or discard) so the supervisor can rebase your branch onto the new base."
-      } > "$HD/feedback.md"
+      } | feedback_route "$TASK" || true
       echo "sync: '$TASK' has uncommitted changes — asked the worker to commit first."
       progress_log SYNC_CONFLICT "$TASK" "$BRANCH" "dirty worktree; rebase deferred to worker"
       exit 9
@@ -71,13 +69,12 @@ for TASK in "${tasks[@]}"; do
     else
       files="$(git -C "$WT" diff --name-only --diff-filter=U 2>/dev/null || true)"
       git -C "$WT" rebase --abort 2>/dev/null || true
-      mkdir -p "$HD"
       { echo "# Rebase conflict onto $BASE_BRANCH — resolve these, then commit:"
         echo "$files"
         echo
         echo "You are NOT allowed to run 'git rebase' yourself; instead re-apply your intent on top"
         echo "of the current files (the supervisor will rebase again), or ask the supervisor."
-      } > "$HD/feedback.md"
+      } | feedback_route "$TASK" || true
       echo "sync: '$TASK' has a rebase CONFLICT — routed to its feedback.md for the worker to resolve."
       progress_log SYNC_CONFLICT "$TASK" "$BRANCH" "rebase conflict onto $BASE_BRANCH"
       notify "$TASK rebase conflict — needs attention"

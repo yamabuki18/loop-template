@@ -18,13 +18,21 @@
 #   loop harness                    interactive wizard (pick packs, confirm, adopt)
 #   loop harness list               show available packs + what each would install
 #   loop harness apply <pack>...    adopt pack(s) non-interactively
+#   loop harness apply <dir>        adopt an EXTERNAL pack (pack spec v1) from a directory —
+#                                   an argument containing '/' is a path, not a shipped pack
 #   loop harness status             show what this workspace's harness/gate contains
+#
+# External packs (built elsewhere, e.g. authored by the loop-pack-author skill) must satisfy
+# pack spec v1: pack.md frontmatter with enforces/when-to-remove (requires/origin recommended),
+# and — because their guards were not fixed by this engine's tests-toolkit — a selftest/ case
+# per L2 guard (stdin fixture named <guard>.<desc>.exit<0|2>.json, run with HARNESS_WORKTREE=/wt
+# against pack-shipped config defaults). Selftests run BEFORE anything is installed.
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
 PACKS_DIR="$ENGINE_DIR/packs"
 
-usage() { sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 packs_available() {
   [ -d "$PACKS_DIR" ] || return 0
@@ -39,6 +47,60 @@ pack_summary() { # <pack> — first non-frontmatter, non-empty line of pack.md
   local f="$PACKS_DIR/$1/pack.md"
   [ -f "$f" ] || { echo "(no pack.md)"; return 0; }
   awk '/^---$/{fm++; next} fm!=1 && NF {sub(/^# */,""); print; exit}' "$f"
+}
+
+# frontmatter_field <pack.md> <field> — value of a frontmatter line, empty if absent.
+frontmatter_field() {
+  awk -v f="$2:" '/^---$/{fm++; next} fm==1 && index($0, f)==1 { sub("^" f "[ ]*", ""); print; exit }' "$1" 2>/dev/null || true
+}
+
+# Run a pack's selftest cases against a STAGED copy of its guards + shipped config defaults,
+# before anything touches the workspace. Case files: selftest/<guard>.<desc>.exit<0|2>.json —
+# the raw PreToolUse stdin JSON; fixtures reference paths under /wt and run with
+# HARNESS_WORKTREE=/wt. Staging mirrors the installed layout (worker-harness.d/ + ../gate.d/)
+# so guards resolve their config exactly as they will once adopted.
+selftest_pack() { # <pack-src-dir> <pack-name> — dies on any failing case
+  local d="$1" pack="$2" td c base g exp rc ran=0
+  [ -d "$d/selftest" ] || return 0
+  td="$(mktemp -d)"
+  mkdir -p "$td/worker-harness.d" "$td/gate.d"
+  if [ -d "$d/guards" ]; then cp -r "$d/guards/." "$td/worker-harness.d/" 2>/dev/null || true; fi
+  if [ -d "$d/config" ]; then cp -r "$d/config/." "$td/gate.d/" 2>/dev/null || true; fi
+  for c in "$d/selftest"/*.exit*.json; do
+    [ -f "$c" ] || continue
+    base="$(basename "$c")"
+    g="${base%%.*}"
+    exp="${base##*.exit}"; exp="${exp%.json}"
+    if [ ! -f "$td/worker-harness.d/$g" ]; then
+      rm -rf "$td"; die "harness: selftest case '$base' names no guard '$g' in $pack/guards/"
+    fi
+    if ( HARNESS_WORKTREE=/wt bash "$td/worker-harness.d/$g" < "$c" ) >/dev/null 2>&1; then rc=0; else rc=$?; fi
+    if [ "$rc" != "$exp" ]; then
+      rm -rf "$td"; die "harness: selftest FAILED for pack '$pack' — $base expected exit $exp, got $rc. Nothing was installed."
+    fi
+    ran=$((ran + 1))
+  done
+  rm -rf "$td"
+  [ "$ran" -gt 0 ] && echo "harness:  selftest — $ran case(s) passed (guards conform to stdin-JSON -> exit 0/2)"
+  return 0
+}
+
+# External packs (adopted from a path) were not fixed by the engine's tests-toolkit, so the
+# spec is enforced at the door: frontmatter contract, and a selftest case per L2 guard.
+validate_external_pack() { # <pack-src-dir> <pack-name>
+  local d="$1" pack="$2" f g v
+  f="$d/pack.md"
+  [ -f "$f" ] || die "harness: external pack '$pack' has no pack.md"
+  [ -n "$(frontmatter_field "$f" enforces)" ]       || die "harness: external pack '$pack' — pack.md frontmatter must declare 'enforces:'"
+  [ -n "$(frontmatter_field "$f" when-to-remove)" ] || die "harness: external pack '$pack' — pack.md frontmatter must declare 'when-to-remove:' (capability-assist assumptions are re-examined every model generation)"
+  for g in "$d/guards"/*; do
+    [ -f "$g" ] || continue
+    ls "$d/selftest/$(basename "$g")".*.exit*.json >/dev/null 2>&1 \
+      || die "harness: external pack '$pack' — L2 guard '$(basename "$g")' has no selftest case (selftest/$(basename "$g").<desc>.exit<0|2>.json). Guards from outside the engine are not adopted unverified."
+  done
+  v="$(frontmatter_field "$f" origin)";   [ -n "$v" ] && echo "harness:  origin  : $v (update THERE, then re-apply to propagate)"
+  v="$(frontmatter_field "$f" requires)"; [ -n "$v" ] && echo "harness:  requires: $v (gate checks must fail loud, never skip silently, when this is missing)"
+  return 0
 }
 
 # Append a snippet to a target file exactly once (marker-idempotent — the marker id must be
@@ -58,10 +120,22 @@ append_once() { # <marker-id> <snippet-file> <target-file> [seed-file]
   echo "harness:  $target <- $id"
 }
 
-apply_pack() { # <pack>
-  local pack="$1" d="$PACKS_DIR/$1" f
-  [ -d "$d" ] || die "unknown pack '$pack' (loop harness list)"
-  echo "harness: adopting pack '$pack' -> $CONFIG_DIR"
+apply_pack() { # <shipped-pack-name | path/to/external/pack>
+  local arg="$1" pack d f
+  if [[ "$arg" == */* ]]; then
+    # External pack (pack spec v1): validated + selftested at the door, then adopted through
+    # the exact same seams as a shipped pack. The pack id is its directory name.
+    d="$(cd "$arg" 2>/dev/null && pwd)" || die "harness: no such pack directory '$arg'"
+    pack="$(basename "$d")"
+    echo "harness: adopting EXTERNAL pack '$pack' ($d) -> $CONFIG_DIR"
+    validate_external_pack "$d" "$pack"
+    selftest_pack "$d" "$pack"
+  else
+    pack="$arg"; d="$PACKS_DIR/$arg"
+    [ -d "$d" ] || die "unknown pack '$pack' (loop harness list)"
+    echo "harness: adopting pack '$pack' -> $CONFIG_DIR"
+    selftest_pack "$d" "$pack"   # shipped packs may carry selftests too; run them if present
+  fi
   # L1 advisory snippets.
   append_once "$pack/rules"  "$d/RULES.snippet.md"        "$CONFIG_DIR/skills/RULES.md"        "$ENGINE_DIR/skills/RULES.md"
   append_once "$pack/arch"   "$d/ARCHITECTURE.snippet.md" "$CONFIG_DIR/skills/ARCHITECTURE.md" "$ENGINE_DIR/skills/ARCHITECTURE.md"

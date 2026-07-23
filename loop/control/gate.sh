@@ -140,7 +140,9 @@ fi
 # above. They live in the WORKSPACE — outside the repo and outside every worker worktree — so
 # a worker structurally cannot edit its own acceptance criteria. Env contract for a check:
 # cwd = merged tree; GATE_TASK / GATE_BRANCH / GATE_BASE_BRANCH / GATE_MERGE_BASE describe the
-# change under review. Exit 0 = pass, non-zero = fail the gate with that code.
+# change under review. Exit 0 = pass, non-zero = fail the gate with that code — checks should
+# exit 1 (or >=10): 3/4/6 are RESERVED by this script (conflict/protected-path/test-gaming)
+# and reusing them makes the failure unreadable downstream (escalation packets, operators).
 if [ -d "$CONFIG_DIR/gate.d" ]; then
   mb="${mb:-$(git -C "$WT" merge-base "$BASE_BRANCH" "$BRANCH")}"
   for chk in "$CONFIG_DIR/gate.d"/*.sh; do

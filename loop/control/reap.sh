@@ -27,5 +27,5 @@ git -C "$CANONICAL" worktree remove --force "$(worktree_for "$TASK")" 2>/dev/nul
 git -C "$CANONICAL" worktree remove --force "$REVIEW_DIR/$TASK" 2>/dev/null || true
 git -C "$CANONICAL" branch -D "$(branch_for "$TASK")" 2>/dev/null || true
 git -C "$CANONICAL" worktree prune 2>/dev/null || true
-rm -rf "$STATE_DIR/workers/$TASK" "$STATE_DIR/$TASK.env" "$STATE_DIR/$TASK.codex-rounds"
+rm -rf "$STATE_DIR/workers/$TASK" "$STATE_DIR/$TASK.env" "$STATE_DIR/$TASK.codex-rounds" "$STATE_DIR/$TASK.verified"
 echo "reaped '$TASK'"

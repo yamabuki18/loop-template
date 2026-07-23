@@ -52,5 +52,8 @@ integration.
 
 ## When you finish a unit of work
 - Commit each logical unit as you go (a commit is instantly visible to the supervisor).
-- When the task is implemented (or feedback is addressed), append a one-line summary to
-  `$HARNESS_DIR/STATUS`, ending with `DONE`. The supervisor will verify and merge.
+  **Verification is triggered by your COMMITS** — finished work left uncommitted is invisible
+  and will never be verified or merged.
+- When the task is implemented (or feedback is addressed), also append a one-line summary to
+  `$HARNESS_DIR/STATUS`, ending with `DONE`. STATUS feeds the human dashboards (status/
+  dashboard) — it signals intent to people, it does not trigger the machine.

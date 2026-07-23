@@ -387,7 +387,11 @@ herdr workspace <project>
   codex・herdr が死んでいてもループは縮退して前進する（CODEX_SKIP / AGENT_UNKNOWN_GRACE）。
   **ハング/無進捗ワーカーは生存性ウォッチドッグが nudge→自動 respawn→ESCALATE で回収**し、
   1 ワーカーの沈黙がゴール全体を止めない（WORKER_TIMEOUT_SECS / WORKER_HANG_GRACE）。クラッシュ後の
-  再起動時は `- [~]`（進行中）ゴールを `- [ ]` へ戻して取り零しを防ぐ。
+  再起動は**割当台帳**（state/loop-active.json、遷移ごとに永続化）から進行中ゴール・キュー・
+  実装中スライスを**復元**する（再計画・再割当で実装中ワーカーを潰さない）。台帳の無い孤児
+  `- [~]` ゴールだけ `- [ ]` へ戻して取り零しを防ぐ。backlog のマークは
+  `[ ]`=未着手 / `[~]`=進行中 / `[x]`=完了 / **`[!]`=全スライスがエスカレートし人間レビュー待ち**
+  （state/escalations/ を見る。`[x]` に偽装しない）。
 - **#2 並列**：ワーカーは canonical の **git worktree**（refs/objects 共有）。コミット即可視なので
   exchange も push も不要。縦割り（各ワーカーが自分のディレクトリだけ）＋ owned-paths を
   `harness-guard-paths` で**強制**。base は canonical が checkout 済み＝ワーカーは**構造的に**触れない。
@@ -489,7 +493,15 @@ v3.4 でゲートは 3 点強化された:
   （手書きでも `loop harness` 由来でも同じ場所・同じ契約）。プロジェクトのチェックに**追加で**
   マージ済みツリー上で実行される。ワークスペース側にあるためワーカーは自分の受け入れ基準に
   触れない（cwd=マージ済みツリー、`GATE_TASK` / `GATE_BRANCH` / `GATE_BASE_BRANCH` /
-  `GATE_MERGE_BASE` が渡る）。
+  `GATE_MERGE_BASE` が渡る）。失敗は exit 1（または 10 以上）で返すこと — **3/4/6 は gate.sh
+  の予約値**（衝突/protected/test-gaming）。
+- **F2P プリフライト**（`F2P_CHECK_CMD`、既定 off）: 「テストファイルを 1 つ実行するコマンド」
+  を設定すると、planner の新規契約テストがコミット前に**現行 base 上で実行され、fail すること**
+  を機械検証する。base で既に通るテストは何も規定しておらず、永遠に通らないテストはワーカーの
+  ラウンドを全部燃やしてから発覚する — どちらもここで弾く。
+- **verify→land の鮮度トークン**: verify PASS 時に (base, branch) の sha 対を記録し、両方が
+  不変なら land の再ゲートをスキップする（半自律モードの二重ゲート解消。新コミット・rebase・
+  他スライスの land があれば自動的に無効化され再ゲートする）。
 
 **検証器も改訂対象**: 検証器は人間意図の proxy に過ぎず、固定すると劣化する（生成側と共進化
 させる）。スライスが ESCALATED すると `state/escalations/` に「実装が悪い/ゲートが悪い」の
@@ -509,12 +521,21 @@ v3.4 でゲートは 3 点強化された:
 loop harness                # 対話ウィザード（パックを選んで取込）
 loop harness list           # 同梱パック一覧
 loop harness apply backend-clean-arch frontend-humble-object ontology-aif
+loop harness apply /path/to/my-pack   # 外部産パック（pack spec v1）をパスで取込
 loop harness status         # このワークスペースのハーネス/ゲートに何が入っているか
 ```
 
 パックの設定は `gate.d/*.env`（**これを編集すると強制が発火する**。未設定の間は助言のみ）。
 L2 ガードと L3 チェックが同じ設定ファイルを読むため、編集時ブロックとマージ時検査で規則が
 食い違うことはない。詳細は `packs/README.md`。
+
+**外部産パックの取り込み（pack spec v1）**: パック形式は交換形式でもある。他リポジトリで
+作ったパック（ホスト全体スキル `loop-pack-author` で書き起こせる）は `apply <ディレクトリ>`
+で取り込む。外部産には frontmatter 契約（enforces / when-to-remove 必須、origin / requires
+推奨）と、L2 ガード 1 つにつき 1 ケース以上の selftest（stdin fixture → 期待 exit）が要求され、
+**インストール前に**ステージ実行して契約違反なら取り込み中止。外部の lint ツール等はツール
+本体を元リポジトリに残し、パックは薄いラッパーだけを運ぶ（「検査不能」を緑にしない規約を
+含め `packs/README.md` 参照）。
 
 **簡素化原則（when-to-remove）**: ハーネス部品は「モデルが単独でできないこと」への仮定の
 符号化であり、新モデル世代ごとに再検証して支えになっていない部品は剥がす。各パックは

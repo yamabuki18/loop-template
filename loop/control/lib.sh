@@ -95,6 +95,10 @@ if [ -f "$CONFIG_DIR/config.env" ]; then source "$CONFIG_DIR/config.env"; fi
 # TREE, so a worker editing harness/check.sh could neuter its own gate — the cheapest reward
 # hack there is). Enforced in gate.sh like PROTECTED_PATHS (exit 4). 1 = on (default).
 : "${GATE_PROTECT_HARNESS:=1}"
+# F2P preflight (plan.sh): command that runs ONE contract-test file (appended as last arg) so
+# the planner's new tests can be checked to FAIL on the current base before they are committed.
+# Empty = off. See f2p_preflight below.
+: "${F2P_CHECK_CMD:=}"
 # Design SSOT direct-read (plan.sh): absolute path to a typed-design tree (e.g. a Spec Atlas
 # atlas/ in an external design repo) the planner reads directly. Empty = auto-detect
 # <repo>/atlas/ when present.
@@ -305,16 +309,85 @@ worker_watchdog_action() {
 # as "- [~]"; if the loop then crashes, next_goal (which only matches "- [ ]") would skip that
 # goal forever and it would be silently lost. On (re)start, flip every "- [~]" back to "- [ ]"
 # so the goal is re-picked. Idempotent. Echoes the number of goals reset.
-#   backlog_reset_inprogress <backlog.md>
+# The optional 2nd arg names ONE goal to leave marked "- [~]": the goal restored from the
+# active-state ledger (see loop_active_* below) is still genuinely in progress — flipping it
+# would let DISCOVER re-plan it onto workers that are mid-slice.
+#   backlog_reset_inprogress <backlog.md> [except-goal]
 backlog_reset_inprogress() {
-  local f="${1:?}" n
+  local f="${1:?}" except="${2:-}" before after tmp
   [ -f "$f" ] || { echo 0; return 0; }
-  n="$(grep -cE '^- \[~\] ' "$f" 2>/dev/null || true)"; n="${n:-0}"
-  if [ "$n" -gt 0 ]; then
-    local tmp; tmp="$(mktemp)"
-    sed -E 's/^- \[~\] /- [ ] /' "$f" > "$tmp" && mv "$tmp" "$f"
+  before="$(grep -cE '^- \[~\] ' "$f" 2>/dev/null || true)"; before="${before:-0}"
+  [ "$before" -gt 0 ] || { echo 0; return 0; }
+  tmp="$(mktemp)"
+  EXCEPT="$except" awk '
+    BEGIN { e = ENVIRON["EXCEPT"] }
+    { if ($0 ~ /^- \[~\] / && (e == "" || $0 != "- [~] " e)) sub(/^- \[~\] /, "- [ ] ")
+      print }' "$f" > "$tmp" && mv "$tmp" "$f"
+  after="$(grep -cE '^- \[~\] ' "$f" 2>/dev/null || true)"; after="${after:-0}"
+  echo $((before - after))
+}
+
+# --- loop active-state ledger (crash-restart reconciliation for in-flight slices) --------------
+# loop.sh's assignment state (active goal / queued slices / busy workers) used to live only in
+# process memory: a heartbeat crash re-planned the same goal onto workers STILL implementing it
+# (assign.sh overwrote their task.md/owned-paths, and their unlanded commits hid behind the
+# freshly-primed SEEN). The ledger persists every transition to state/loop-active.json; on
+# start, loop.sh restores from it instead of re-planning. Writes are best-effort (rc 0 always):
+# a failed save degrades to the old re-plan behavior, it never kills the heartbeat.
+loop_active_file() { echo "$STATE_DIR/loop-active.json"; }
+loop_active_save() { # <goal> <queue-json-array> <busy-json-object> [landed] [escalated]
+  # NB: no "${3:-{}}" here — inside ${...} bash closes the expansion at the FIRST '}', so that
+  # spelling appends a stray brace to a provided value and corrupts the JSON.
+  local goal="${1:-}" queue="${2:-}" busy="${3:-}" landed="${4:-0}" escal="${5:-0}" tmp
+  [ -n "$queue" ] || queue='[]'
+  [ -n "$busy" ]  || busy='{}'
+  case "$landed" in ''|*[!0-9]*) landed=0;; esac
+  case "$escal"  in ''|*[!0-9]*) escal=0;; esac
+  command -v jq >/dev/null 2>&1 || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  tmp="$(mktemp 2>/dev/null)" || return 0
+  if jq -n --arg goal "$goal" --argjson queue "$queue" --argjson busy "$busy" \
+       --argjson landed "$landed" --argjson escalated "$escal" \
+       '{goal: $goal, queue: $queue, busy: $busy, landed: $landed, escalated: $escalated}' > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$(loop_active_file)" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
   fi
-  echo "$n"
+  return 0
+}
+loop_active_clear() { rm -f "$(loop_active_file)" 2>/dev/null || true; }
+# loop_active_goal <backlog.md> — echo the ledger's goal IFF the backlog still marks it
+# "- [~]" (in progress); empty output otherwise. The [~] check rejects a stale ledger (goal
+# since completed, backlog edited) without trusting timestamps. Always rc 0.
+loop_active_goal() {
+  local bl="${1:-}" f g
+  f="$(loop_active_file)"
+  [ -f "$f" ] && [ -f "$bl" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  if ! g="$(jq -r '.goal // empty' "$f" 2>/dev/null)"; then return 0; fi
+  [ -n "$g" ] || return 0
+  grep -qxF -- "- [~] $g" "$bl" || return 0
+  printf '%s\n' "$g"
+  return 0
+}
+
+# Burst gating decision (PURE — unit-tested; loop.sh and watch.sh SHARE it — the two copies of
+# this state machine had already begun to drift). Given a worker's branch head, the last-gated
+# head, the herdr agent state and the consecutive unknown-state count, decide whether to gate
+# NOW. Echoes "<action> <new-unknown-count>":
+#   none  — no new commit to gate            wait — mid-burst ('working'), more commits coming
+#   defer — unknown state, inside AGENT_UNKNOWN_GRACE
+#   gate  — burst over, gate now             force — unknown past grace: gate anyway (a crashed
+#                                             pane must not strand committed work)
+gate_now_decision() { # <head> <seen> <agent-state> <unknown-count>
+  local h="${1:-none}" seen="${2:-}" st="${3:-none}" unk="${4:-0}"
+  if [ "$h" = "$seen" ] || [ "$h" = none ]; then echo "none $unk"; return 0; fi
+  case "$st" in
+    working)           echo "wait 0"; return 0 ;;
+    idle|blocked|done) echo "gate 0"; return 0 ;;
+  esac
+  unk=$((unk + 1))
+  if [ "$unk" -lt "${AGENT_UNKNOWN_GRACE:-6}" ]; then echo "defer $unk"; else echo "force 0"; fi
 }
 
 # sync.sh decision when herdr can't report a worker's state (PURE — unit-tested). Given how many
@@ -696,6 +769,75 @@ ontology_digest_refresh() {
     jq -rs 'group_by(.node) | map("- \(.[0].node): \(length)") | .[]' "$g" 2>/dev/null || true
   } > "$tmp" 2>/dev/null && mv "$tmp" "$MEMORY_DIR/ontology/digest.md" 2>/dev/null || rm -f "$tmp"
   return 0
+}
+
+# Seed a Claude config dir's onboarding state + host-login credential — the ONE implementation
+# shared by spawn.sh / supervise.sh / plan.sh (three drifting copies before). Seed-once by
+# design: .claude.json accumulates live session state, and the credential copy is the
+# operator's own login (auth_mode 'host' convenience; doctor notes the concealment tradeoff).
+claude_cfg_seed() { # <cfg-dir> <worktree-path-for-onboarding-template>
+  local cfg="${1:?}" wt="${2:?}"
+  mkdir -p "$cfg"
+  if [ ! -f "$cfg/.claude.json" ]; then
+    sed "s|__WORKTREE__|$wt|g" "$CONTROL_DIR/worker-claude.template.json" > "$cfg/.claude.json"
+  fi
+  if ! secret_present worker && [ -f "$HOME/.claude/.credentials.json" ] && [ ! -f "$cfg/.credentials.json" ]; then
+    cp "$HOME/.claude/.credentials.json" "$cfg/.credentials.json"
+    chmod 600 "$cfg/.credentials.json" 2>/dev/null || true
+    echo "note: no worker-scope secret — seeded the host claude login (clean way: loop secrets edit worker)"
+  fi
+  return 0
+}
+
+# --- F2P preflight (opt-in, F2P_CHECK_CMD) --------------------------------------------------------
+# A contract test that already PASSES on the current base specifies nothing (F2P = fail-to-pass),
+# and one that can never pass burns every feedback round before surfacing as an escalation.
+# When F2P_CHECK_CMD is set (a command that runs ONE test file, appended as its last argument,
+# e.g. "npx vitest run" / "pytest"), run each slice's contract tests against BASE + the new
+# tests in a disposable worktree and reject the ones that PASS. Empty = off (default — not
+# every project can run a single test file in isolation). rc 1 + stderr listing on violation.
+f2p_preflight() { # <slices.json> <tests-src-dir>
+  local slices="${1:?}" src="${2:?}" wt viol="" tf
+  [ -n "${F2P_CHECK_CMD:-}" ] || return 0
+  [ -d "$src" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  wt="$STATE_DIR/f2p.$$"
+  git -C "$CANONICAL" worktree add --detach "$wt" "$BASE_BRANCH" >/dev/null 2>&1 || return 0
+  mkdir -p "$wt/tests"
+  cp -r "$src/." "$wt/tests/" 2>/dev/null || true
+  while IFS= read -r tf; do
+    [ -n "$tf" ] && [ -f "$wt/$tf" ] || continue
+    # Gate-scope secrets, same as the gate itself: deterministic child process, never a Claude.
+    if ( cd "$wt" && secret_exec gate -- bash -c "$F2P_CHECK_CMD \"\$1\"" _ "$tf" ) >/dev/null 2>&1; then
+      viol+="  $tf PASSES on the current base — it specifies nothing (F2P violation)"$'\n'
+    fi
+  done < <(jq -r '.[].tests[]?' "$slices" 2>/dev/null | sort -u)
+  git -C "$CANONICAL" worktree remove --force "$wt" 2>/dev/null || true
+  git -C "$CANONICAL" worktree prune 2>/dev/null || true
+  [ -z "$viol" ] || { printf '%s' "$viol" >&2; return 1; }
+  return 0
+}
+
+# --- worker feedback routing (single choke point) ------------------------------------------------
+# feedback.md has FOUR producers (verify FAIL, verify codex concerns, sync dirty/conflict,
+# loop watchdog). Truncating `>` writes let a later, lower-stakes note ERASE an unaddressed
+# failure log (e.g. a post-land sync note wiping the gate failures the worker never read).
+# Contract: if the existing feedback is still UNADDRESSED — file mtime newer than the branch's
+# last commit, the same freshness rule harness-stop-gate uses — APPEND the new text as a
+# separated section; once the worker has committed past it (addressed), start fresh.
+feedback_route() { # <task>   (stdin -> that worker's feedback.md, merge-aware)
+  local t="${1:?}" hd fb last mt
+  hd="$(harness_dir "$t")"; fb="$hd/feedback.md"
+  mkdir -p "$hd" 2>/dev/null || return 1
+  if [ -f "$fb" ]; then
+    last="$(git -C "$CANONICAL" log -1 --format=%ct "refs/heads/$(branch_for "$t")" 2>/dev/null || echo 0)"
+    mt="$(stat -c %Y "$fb" 2>/dev/null || echo 0)"
+    if [ "${mt:-0}" -gt "${last:-0}" ]; then
+      { echo; echo '---'; echo; cat; } >> "$fb"
+      return 0
+    fi
+  fi
+  cat > "$fb"
 }
 
 # --- verifier co-evolution seam ------------------------------------------------------------------

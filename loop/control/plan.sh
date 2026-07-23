@@ -34,11 +34,7 @@ git -C "$CANONICAL" worktree add --detach "$PLAN_DIR/repo" "$BASE_BRANCH" >/dev/
 
 # Clean planner config: onboarding pre-seeded, NO hooks (supervisor role). Host-login
 # convenience mirrors spawn.sh when no worker-scope secret exists.
-sed "s|__WORKTREE__|$PLAN_DIR/repo|g" "$CONTROL_DIR/worker-claude.template.json" > "$PLAN_DIR/cfg/.claude.json"
-if ! secret_present worker && [ -f "$HOME/.claude/.credentials.json" ]; then
-  cp "$HOME/.claude/.credentials.json" "$PLAN_DIR/cfg/.credentials.json"
-  chmod 600 "$PLAN_DIR/cfg/.credentials.json" 2>/dev/null || true
-fi
+claude_cfg_seed "$PLAN_DIR/cfg" "$PLAN_DIR/repo"
 
 # Design SSOT direct-read: when the project's design lives as TYPED DATA (e.g. a Spec Atlas
 # atlas/ tree — Lean sources under Domain/=vocabulary+types, Spec/=the design data), the
@@ -199,15 +195,24 @@ if [ "$so_mode" != off ] && [ -x "$CONTROL_DIR/second-opinion.sh" ]; then
   fi
 fi
 
+# F2P preflight (opt-in, F2P_CHECK_CMD in config.env): verify the planner's contract tests
+# actually FAIL on the current base BEFORE they are committed — a test that already passes
+# specifies nothing, and the defect otherwise surfaces only after workers burn feedback rounds.
+f2p_preflight "$slices" "$PLAN_DIR/out/tests" \
+  || die "F2P preflight failed (violations above): the planner's contract tests must fail on the current base."
+
 # Commit the planner's contract tests into canonical tests/ on BASE_BRANCH so the gate enforces
 # them. Only files under /out/tests are taken (supervisor owns tests/; nothing else is trusted).
 # Workers see the new base instantly (shared refs) — sync.sh rebases the live ones.
+# The commit is PATHSPEC-SCOPED (-- tests/): a bare `git commit` sweeps the whole index, and in
+# supervise mode the supervisor Claude works with cwd=canonical — anything it left staged would
+# silently ride along in the "contract tests" commit. The staged-check is scoped the same way.
 if [ -n "$(ls -A "$PLAN_DIR/out/tests" 2>/dev/null)" ]; then
   mkdir -p "$CANONICAL/tests"
   cp -r "$PLAN_DIR/out/tests/." "$CANONICAL/tests/"
   git -C "$CANONICAL" add tests/
-  if ! git -C "$CANONICAL" diff --cached --quiet; then
-    git -C "$CANONICAL" commit -q -m "contract tests for goal: $GOAL" \
+  if ! git -C "$CANONICAL" diff --cached --quiet -- tests/; then
+    git -C "$CANONICAL" commit -q -m "contract tests for goal: $GOAL" -- tests/ \
       && echo "plan: committed contract tests to $BASE_BRANCH (canonical)."
   fi
 fi

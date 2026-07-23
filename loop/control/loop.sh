@@ -45,7 +45,8 @@ for w in "${WORKERS[@]}"; do SEEN["$w"]="$(worker_head "$w")"; BUSY["$w"]=0; ROU
 
 QUEUE=()                 # pending slices (compact JSON) for the ACTIVE goal
 ACTIVE_GOAL=""
-ACTIVE_REMAINING=0       # slices of the active goal not yet landed/escalated
+GOAL_LANDED=0            # slices of the active goal that LANDED — decides the completion mark:
+GOAL_ESCALATED=0         # 0 landed + >0 escalated -> "- [!]" (incomplete), never a silent "[x]"
 
 # --- backlog helpers (memory/backlog.md is the DISCOVER input) ---
 BACKLOG="$MEMORY_DIR/backlog.md"
@@ -77,6 +78,19 @@ mark_goal() {  # mark_goal <x|~> <goal-text>  — flip that goal's checkbox in p
 
 free_worker() { for w in "${WORKERS[@]}"; do [ "${BUSY[$w]}" = 0 ] && { echo "$w"; return; }; done; }
 any_busy()    { for w in "${WORKERS[@]}"; do [ "${BUSY[$w]}" = 1 ] && return 0; done; return 1; }
+
+# Persist the assignment state (ledger, lib.sh loop_active_*) on every transition, so a crashed
+# heartbeat restores in-flight slices instead of re-planning them onto busy workers. Best-effort.
+save_active() {
+  local w qjson='[]' busy='{}'
+  [ "${#QUEUE[@]}" -gt 0 ] && qjson="$(printf '%s\n' "${QUEUE[@]}" | jq -cs '.' 2>/dev/null || echo '[]')"
+  for w in "${WORKERS[@]}"; do
+    [ "${BUSY[$w]}" = 1 ] || continue
+    busy="$(jq -c --arg w "$w" --arg s "${SLICE[$w]}" --argjson r "${ROUNDS[$w]:-0}" \
+            '. + {($w): {slice: $s, rounds: $r}}' <<<"$busy" 2>/dev/null || echo "$busy")"
+  done
+  loop_active_save "$ACTIVE_GOAL" "$qjson" "$busy" "$GOAL_LANDED" "$GOAL_ESCALATED"
+}
 
 # --- subscription usage guard (USAGE_GUARD) ---
 # The plan's 5-hour/7-day windows are shared by every worker (same account), so pacing is a
@@ -120,10 +134,34 @@ usage_pause() { # <why> — sleep until the limiting window resets (re-probing),
   done
 }
 
-# Crash reconciliation: a previous run may have died with a goal marked "- [~]" (in progress).
-# next_goal only picks "- [ ]", so reset orphaned "~" goals back to unstarted before we begin.
+# Crash reconciliation, two layers:
+#   1. Ledger restore: a previous run persisted its assignment state (state/loop-active.json,
+#      written on every transition). If its goal is still "- [~]" in the backlog, restore
+#      ACTIVE_GOAL/QUEUE/BUSY instead of re-planning — re-assignment would overwrite
+#      task.md/owned-paths under workers that are STILL implementing, and their unlanded
+#      commits would hide behind a freshly-primed SEEN. SEEN is blanked for restored-busy
+#      workers so already-committed work gates on the next idle burst.
+#   2. Backlog reset: every OTHER "- [~]" goal is an orphan from a run that died before
+#      assigning anything (no ledger) — flip it back to "- [ ]" so it is re-picked.
+RESTORED_GOAL=""
 if [ -f "$BACKLOG" ]; then
-  reset_n="$(backlog_reset_inprogress "$BACKLOG")"
+  if g="$(loop_active_goal "$BACKLOG")" && [ -n "$g" ]; then
+    ACTIVE_GOAL="$g"; RESTORED_GOAL="$g"
+    mapfile -t QUEUE < <(jq -c '.queue[]?' "$(loop_active_file)" 2>/dev/null)
+    nbusy=0
+    while IFS=$'\t' read -r w s r; do
+      # Unknown worker (fleet changed since the crash)? Skip — its slice re-queues via re-plan.
+      [ -n "$w" ] && [ -n "${BUSY[$w]+x}" ] || continue
+      BUSY["$w"]=1; SLICE["$w"]="$s"; ROUNDS["$w"]="${r:-0}"
+      SEEN["$w"]=""; PROG["$w"]="$(date +%s)"; START["$w"]="${PROG[$w]}"
+      nbusy=$((nbusy + 1))
+    done < <(jq -r '.busy | to_entries[] | [.key, .value.slice, (.value.rounds // 0)] | @tsv' "$(loop_active_file)" 2>/dev/null)
+    GOAL_LANDED="$(jq -r '.landed // 0' "$(loop_active_file)" 2>/dev/null || echo 0)"
+    GOAL_ESCALATED="$(jq -r '.escalated // 0' "$(loop_active_file)" 2>/dev/null || echo 0)"
+    echo "loop: restored in-flight goal from the ledger — '$g' (${#QUEUE[@]} queued, $nbusy busy)."
+    progress_log RESTORED "-" "-" "$g (${#QUEUE[@]} queued, $nbusy busy)"
+  fi
+  reset_n="$(backlog_reset_inprogress "$BACKLOG" "$RESTORED_GOAL")"
   [ "${reset_n:-0}" -gt 0 ] && { echo "loop: reconciled $reset_n orphaned in-progress goal(s) from a prior run."; progress_log RECONCILED "-" "-" "reset $reset_n in-progress goal(s)"; }
 fi
 
@@ -164,28 +202,48 @@ while true; do
 
   # ── DISCOVER/PLAN: only when the queue is empty AND nobody is busy (one goal at a time) ──
   if [ "${#QUEUE[@]}" -eq 0 ] && ! any_busy && [ "$USAGE_DRAIN" = 0 ]; then
-    [ "$ACTIVE_GOAL" ] && { mark_goal x "$ACTIVE_GOAL"; progress_log GOAL_DONE "-" "-" "$ACTIVE_GOAL"; notify "goal complete: $ACTIVE_GOAL"; ACTIVE_GOAL=""; }
+    if [ "$ACTIVE_GOAL" ]; then
+      # Honest completion mark: a goal whose every slice ESCALATED did not "complete" — mark it
+      # "- [!]" (needs-human; next_goal never re-picks it) instead of a silent "[x]".
+      if [ "${GOAL_LANDED:-0}" -eq 0 ] && [ "${GOAL_ESCALATED:-0}" -gt 0 ]; then
+        mark_goal '!' "$ACTIVE_GOAL"
+        progress_log GOAL_INCOMPLETE "-" "-" "$ACTIVE_GOAL (0 landed, ${GOAL_ESCALATED} escalated — review state/escalations/)"
+        notify "goal INCOMPLETE (all slices escalated): $ACTIVE_GOAL"
+      else
+        mark_goal x "$ACTIVE_GOAL"; progress_log GOAL_DONE "-" "-" "$ACTIVE_GOAL"; notify "goal complete: $ACTIVE_GOAL"
+      fi
+      ACTIVE_GOAL=""; loop_active_clear
+    fi
     goal="$(next_goal || true)"
     if [ -z "$goal" ]; then
       echo "loop: backlog empty and all workers idle — DONE."; progress_log LOOP_DONE "-" "-" "backlog drained"; notify "loop complete — backlog drained"; break
     fi
     echo "loop: next goal -> $goal"
-    mark_goal '~' "$goal"; ACTIVE_GOAL="$goal"
+    mark_goal '~' "$goal"; ACTIVE_GOAL="$goal"; GOAL_LANDED=0; GOAL_ESCALATED=0
     if [ "${PLANNER_ENABLED:-1}" = 1 ]; then
       if slices_file="$("$CONTROL_DIR/plan.sh" "$goal" 2>>"$LOG_DIR/plan.log" | tail -1)" && [ -f "$slices_file" ]; then
         mapfile -t QUEUE < <(jq -c '.[]' "$slices_file")
       else
         echo "loop: planner produced no usable slices — see $LOG_DIR/plan.log. Skipping goal."
-        progress_log PLAN_FAIL "-" "-" "$goal"; mark_goal x "$goal"; ACTIVE_GOAL=""; sleep "$LOOP_POLL_SECS"; continue
+        progress_log PLAN_FAIL "-" "-" "$goal"; mark_goal x "$goal"; ACTIVE_GOAL=""; loop_active_clear; sleep "$LOOP_POLL_SECS"; continue
       fi
     else
-      # PLANNER_ENABLED=0: read human-authored slices from memory/slices/<goal>.json if present.
+      # PLANNER_ENABLED=0: human-authored slices. Resolution: memory/slices/<goal-slug>.json
+      # (goal-scoped) first, else current.json. The consumed file is ARCHIVED (*.consumed-<utc>)
+      # so the next goal can never silently reuse stale slices meant for this one.
+      gslug="$(printf '%s' "$goal" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]\+/-/g' -e 's/^-*//' -e 's/-*$//' | cut -c1-48)"
       human="$MEMORY_DIR/slices/current.json"
-      [ -f "$human" ] || { echo "loop: PLANNER_ENABLED=0 but $human missing — write slices yourself."; sleep "$LOOP_POLL_SECS"; continue; }
+      [ -n "$gslug" ] && [ -f "$MEMORY_DIR/slices/$gslug.json" ] && human="$MEMORY_DIR/slices/$gslug.json"
+      if [ ! -f "$human" ]; then
+        echo "loop: PLANNER_ENABLED=0 but no slices file (memory/slices/${gslug:-goal}.json or current.json) — write slices yourself."
+        mark_goal ' ' "$goal"; ACTIVE_GOAL=""   # un-claim so the goal is re-picked once slices exist
+        sleep "$LOOP_POLL_SECS"; continue
+      fi
       mapfile -t QUEUE < <(jq -c '.[]' "$human")
+      mv "$human" "$human.consumed-$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
     fi
-    ACTIVE_REMAINING="${#QUEUE[@]}"
-    echo "loop: ${ACTIVE_REMAINING} slice(s) queued for goal."
+    echo "loop: ${#QUEUE[@]} slice(s) queued for goal."
+    save_active
   fi
 
   # ── ASSIGN: give free workers the next queued slices (suspended while draining) ──
@@ -209,6 +267,7 @@ while true; do
     PROG["$w"]="$(date +%s)"; STALL["$w"]=0   # start the liveness watchdog clock for this slice
     START["$w"]="${PROG[$w]}"                 # ... and the wall-clock for per-slice telemetry
     progress_log ASSIGNED "$w" "-" "$name"
+    save_active
   done
 
   # ── VERIFY/ITERATE: react to new worker commits (shared refs replace the v2 push marker) ──
@@ -235,13 +294,13 @@ while true; do
       case "$(worker_watchdog_action "$idle_for" "${STALL[$w]}")" in
         warn)
           echo "loop: $w (slice ${SLICE[$w]}) no progress for ${idle_for}s — nudging before reset."
-          hd="$(harness_dir "$w")"; mkdir -p "$hd"
+          hd="$(harness_dir "$w")"
           {
             echo "# Watchdog — no progress detected on $w"
             echo "# No new commit for ${idle_for}s and the agent is not actively working. If you are"
             echo "# stuck, commit what you have (a commit is gated instantly) or simplify. If nothing"
             echo "# changes within ${WORKER_HANG_GRACE:-300}s your worktree is reset and this slice restarts."
-          } > "$hd/feedback.md"
+          } | feedback_route "$w" || true
           agent_send "$w" "Watchdog: no progress for ${idle_for}s — read $hd/feedback.md, then commit or continue." || true
           progress_log STALL_WARN "$w" "-" "${SLICE[$w]} idle ${idle_for}s"
           STALL["$w"]=1; PROG["$w"]="$now"
@@ -266,33 +325,28 @@ while true; do
             if rp="$(escalation_report "$w" "${SLICE[$w]}" "${ROUNDS[$w]}")"; then [ -n "$rp" ] && echo "loop: review packet -> $rp"; fi
             notify "needs human: ${SLICE[$w]} on $w stalled"
             BUSY["$w"]=0; SLICE["$w"]=""; ROUNDS["$w"]=0
-            ACTIVE_REMAINING=$((ACTIVE_REMAINING-1))
+            GOAL_ESCALATED=$((GOAL_ESCALATED+1))
           else
             echo "loop: RESPAWN $w (${SLICE[$w]}) — stalled ${idle_for}s past the nudge; resetting worktree (round ${ROUNDS[$w]}/${MAX_FEEDBACK_ROUNDS})."
             progress_log STALL_RESPAWN "$w" "work/$w" "${SLICE[$w]} round ${ROUNDS[$w]}"
             "$CONTROL_DIR/respawn.sh" "$w" >>"$LOG_DIR/$w.respawn.log" 2>&1 || echo "loop: respawn of $w failed — see $LOG_DIR/$w.respawn.log"
             SEEN["$w"]="$(worker_head "$w")"; PROG["$w"]="$(date +%s)"; STALL["$w"]=0; UNK["$w"]=0
           fi
+          save_active
           continue ;;
       esac
     fi
 
-    # No new commit since we last gated -> nothing to verify this cycle.
-    [ "$h" != "${SEEN[$w]}" ] && [ "$h" != none ] || continue
-    # Gate only when the worker's burst is over: herdr says idle/blocked/done. 'working' means
-    # more commits are likely coming — wait. unknown/none (no herdr, crashed pane) must not
-    # strand committed work: force the gate after AGENT_UNKNOWN_GRACE cycles.
-    case "$st" in
-      working)
-        UNK["$w"]=0; continue ;;
-      idle|blocked|done)
-        UNK["$w"]=0 ;;
-      *)
-        UNK["$w"]=$(( UNK["$w"] + 1 ))
-        if [ "${UNK[$w]}" -lt "${AGENT_UNKNOWN_GRACE:-6}" ]; then continue; fi
-        echo "loop: $w agent state '$st' for ${UNK[$w]} cycles — gating anyway." ;;
+    # Gate only when the worker's burst is over — shared decision (lib.sh gate_now_decision:
+    # wait while 'working', gate on idle/blocked/done, force past AGENT_UNKNOWN_GRACE so a
+    # crashed pane cannot strand committed work).
+    read -r act newunk <<<"$(gate_now_decision "$h" "${SEEN[$w]}" "$st" "${UNK[$w]}")"
+    UNK["$w"]="$newunk"
+    case "$act" in
+      none|wait|defer) continue ;;
+      force) echo "loop: $w agent state '$st' past the unknown grace — gating anyway." ;;
     esac
-    SEEN["$w"]="$h"; UNK["$w"]=0
+    SEEN["$w"]="$h"
     echo "loop: new commits on $w (slice ${SLICE[$w]}) — gating."
     if "$CONTROL_DIR/verify.sh" "$w" >>"$LOG_DIR/$w.gate.log" 2>&1; then
       sha="$(git -C "$CANONICAL" rev-parse --short "$(branch_for "$w")" 2>/dev/null || echo '?')"
@@ -306,7 +360,8 @@ while true; do
         || { echo "loop: land FAILED for $w despite gate pass — see $LOG_DIR/$w.land.log"; progress_log LAND_FAIL "$w" "-" "${SLICE[$w]}"; }
       [ "${AUTO_SYNC:-1}" = 1 ] && "$CONTROL_DIR/sync.sh" --others "$w" >>"$LOG_DIR/sync.log" 2>&1 || true
       BUSY["$w"]=0; SLICE["$w"]=""; ROUNDS["$w"]=0
-      ACTIVE_REMAINING=$((ACTIVE_REMAINING-1))
+      GOAL_LANDED=$((GOAL_LANDED+1))
+      save_active
     else
       ROUNDS["$w"]=$(( ROUNDS["$w"] + 1 ))
       if [ "${ROUNDS[$w]}" -gt "${MAX_FEEDBACK_ROUNDS:-4}" ]; then
@@ -316,11 +371,12 @@ while true; do
         if rp="$(escalation_report "$w" "${SLICE[$w]}" "${ROUNDS[$w]}")"; then [ -n "$rp" ] && echo "loop: review packet -> $rp"; fi
         notify "needs human: ${SLICE[$w]} on $w stuck"
         BUSY["$w"]=0; SLICE["$w"]=""; ROUNDS["$w"]=0
-        ACTIVE_REMAINING=$((ACTIVE_REMAINING-1))
+        GOAL_ESCALATED=$((GOAL_ESCALATED+1))
       else
         echo "loop: FAIL $w round ${ROUNDS[$w]}/${MAX_FEEDBACK_ROUNDS} — feedback routed; worker will re-engage."
         progress_log GATE_FAIL "$w" "-" "${SLICE[$w]} round ${ROUNDS[$w]}"
       fi
+      save_active
     fi
   done
 

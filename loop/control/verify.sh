@@ -17,12 +17,12 @@ TASK="${1:?usage: verify.sh <task>}"
 source "$STATE_DIR/$TASK.env"
 HD="$(harness_dir "$TASK")"
 
-# Route text back to the worker: write feedback.md (out-of-tree state — a plain host file in
-# v3) and nudge its Claude. Delivery is guaranteed by the SessionStart/stop-gate hooks even
-# when the nudge is dropped.
+# Route text back to the worker: feedback.md (out-of-tree state — a plain host file in v3) via
+# the merge-aware single choke point (lib.sh feedback_route — unaddressed feedback is appended
+# to, never erased), then nudge its Claude. Delivery is guaranteed by the SessionStart/stop-gate
+# hooks even when the nudge is dropped.
 route_feedback() { # stdin -> feedback.md
-  mkdir -p "$HD"
-  cat > "$HD/feedback.md"
+  feedback_route "$TASK"
 }
 nudge() {
   if agent_send "$TASK" "Read $HD/feedback.md — the supervisor's checks failed on your branch. Fix the issues, then commit."; then
@@ -55,6 +55,11 @@ if [ "$rc" -eq 0 ]; then
     exit 7
   fi
   rm -f "$fb"
+  # Freshness token for land.sh: this exact (base, branch) sha pair passed the full gate AND
+  # the codex policy — land may skip its redundant re-gate while both are unchanged.
+  printf '%s %s\n' "$(git -C "$CANONICAL" rev-parse "$BASE_BRANCH" 2>/dev/null || echo '?')" \
+                   "$(git -C "$CANONICAL" rev-parse "$BRANCH" 2>/dev/null || echo '?')" \
+    > "$STATE_DIR/$TASK.verified" 2>/dev/null || true
   echo
   echo "VERIFY PASS: $TASK ready. Land it with:  ./control/land.sh $TASK"
   rm -f "$log"

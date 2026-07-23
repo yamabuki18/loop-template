@@ -646,6 +646,159 @@ else ko "backlog_reset_inprogress: wrong result (n=$n)"; fi
 # idempotent: a second pass resets nothing.
 n2="$( source "$CTL/lib.sh"; backlog_reset_inprogress "$bl" )"
 [ "$n2" = 0 ] && ok "backlog_reset_inprogress idempotent (0 on clean backlog)" || ko "backlog_reset_inprogress: expected 0 got $n2"
+# except-arg: the ledger-restored goal stays [~]; every other orphan is still reset.
+printf -- '- [~] restored goal\n- [~] orphan goal\n' > "$bl"
+n3="$( source "$CTL/lib.sh"; backlog_reset_inprogress "$bl" 'restored goal' )"
+if [ "$n3" = 1 ] && grep -qxF -- '- [~] restored goal' "$bl" && grep -qxF -- '- [ ] orphan goal' "$bl"; then
+  ok "backlog_reset_inprogress: except-goal kept [~], orphan reset"
+else ko "backlog_reset_inprogress except: n=$n3 ($(tr '\n' ' ' < "$bl"))"; fi
+
+echo "== lib: gate_now_decision (shared burst gating, loop.sh + watch.sh) =="
+gnd() { # <desc> <expected "action unk"> <head> <seen> <state> <unk>
+  local desc="$1" exp="$2"; shift 2
+  local out
+  out="$( export LOOP_PROJECT="$ws"; source "$CTL/lib.sh"; gate_now_decision "$@" )"
+  [ "$out" = "$exp" ] && ok "gate_now_decision $desc ($out)" || ko "gate_now_decision $desc: expected '$exp' got '$out'"
+}
+gnd "no new commit -> none"          "none 3"  aaa aaa idle    3
+gnd "no branch yet -> none"          "none 0"  none ""  idle   0
+gnd "mid-burst (working) -> wait"    "wait 0"  bbb aaa working 4
+gnd "burst over (idle) -> gate"      "gate 0"  bbb aaa idle    4
+gnd "burst over (blocked) -> gate"   "gate 0"  bbb aaa blocked 0
+gnd "unknown inside grace -> defer"  "defer 1" bbb aaa none    0
+gnd "unknown past grace -> force"    "force 0" bbb aaa none    5
+
+echo "== lib: loop_active ledger (crash-restart reconciliation) =="
+la="$( export LOOP_PROJECT="$ws"; source "$CTL/lib.sh"
+       loop_active_save "goal G" '[{"name":"s2"}]' '{"w1":{"slice":"s1","rounds":2}}'
+       loop_active_file )"
+jq -e '.goal=="goal G" and .queue[0].name=="s2" and .busy.w1.rounds==2 and .landed==0 and .escalated==0' "$la" >/dev/null 2>&1 \
+  && ok "loop_active_save: goal/queue/busy persisted as JSON (landed/escalated default 0)" \
+  || ko "loop_active_save: bad ledger ($(cat "$la" 2>/dev/null))"
+( export LOOP_PROJECT="$ws"; source "$CTL/lib.sh"
+  loop_active_save "goal G" '[]' '{}' 0 2 )
+jq -e '.landed==0 and .escalated==2' "$la" >/dev/null 2>&1 \
+  && ok "loop_active_save: landed/escalated counters persisted" \
+  || ko "loop_active_save counters: $(cat "$la" 2>/dev/null)"
+printf -- '- [~] goal G\n' > "$bl"
+g="$( export LOOP_PROJECT="$ws"; source "$CTL/lib.sh"; loop_active_goal "$bl" )"
+[ "$g" = "goal G" ] && ok "loop_active_goal: in-progress goal restored" || ko "loop_active_goal: got '$g'"
+printf -- '- [x] goal G\n' > "$bl"
+g="$( export LOOP_PROJECT="$ws"; source "$CTL/lib.sh"; loop_active_goal "$bl" )"
+[ -z "$g" ] && ok "loop_active_goal: stale ledger (goal no longer [~]) rejected" || ko "loop_active_goal stale: got '$g'"
+( export LOOP_PROJECT="$ws"; source "$CTL/lib.sh"; loop_active_clear )
+[ ! -e "$la" ] && ok "loop_active_clear removes the ledger" || ko "loop_active_clear: ledger still present"
+
+echo "== lib: feedback_route (merge-aware feedback choke point) =="
+fw="$(mktemp -d)"; touch "$fw/.loop-workspace"
+mkdir -p "$fw/canonical"; git -C "$fw/canonical" init -q -b main
+# Commit in the PAST: the unaddressed check is mtime(feedback) > committime(branch), and a
+# same-second commit+write would be indistinguishable at stat granularity.
+GIT_COMMITTER_DATE='2000-01-01T00:00:00Z' \
+  git -C "$fw/canonical" -c user.email=a@b -c user.name=a commit -q --allow-empty -m init
+git -C "$fw/canonical" branch work/w1
+fr() { ( export LOOP_PROJECT="$fw"; source "$CTL/lib.sh"; feedback_route w1 ); }
+FB="$fw/state/workers/w1/harness/feedback.md"
+printf 'FIRST failure log\n' | fr
+grep -qx 'FIRST failure log' "$FB" 2>/dev/null \
+  && ok "feedback_route: fresh write creates feedback.md" || ko "feedback_route fresh: $(cat "$FB" 2>/dev/null)"
+# Unaddressed (no commit since the first write) -> the second note APPENDS, never erases.
+printf 'SECOND note (sync)\n' | fr
+if grep -qx 'FIRST failure log' "$FB" && grep -qx 'SECOND note (sync)' "$FB" && grep -qx -- '---' "$FB"; then
+  ok "feedback_route: unaddressed feedback appended (both sections present)"
+else ko "feedback_route append: $(tr '\n' ' ' < "$FB")"; fi
+# Addressed (branch committed AFTER the feedback was written) -> start fresh.
+touch -d '2000-01-01 00:00' "$FB"
+git -C "$fw/canonical" -c user.email=a@b -c user.name=a commit -q --allow-empty -m fix
+git -C "$fw/canonical" update-ref refs/heads/work/w1 HEAD
+printf 'THIRD (new round)\n' | fr
+if grep -qx 'THIRD (new round)' "$FB" && ! grep -q 'FIRST failure log' "$FB"; then
+  ok "feedback_route: addressed feedback overwritten (fresh round)"
+else ko "feedback_route overwrite: $(tr '\n' ' ' < "$FB")"; fi
+rm -rf "$fw"
+
+echo "== lib: f2p_preflight (contract tests must fail on base) =="
+fp="$(mktemp -d)"; touch "$fp/.loop-workspace"
+mkdir -p "$fp/canonical" "$fp/out-tests"
+git -C "$fp/canonical" init -q -b main
+( cd "$fp/canonical" && git config user.email a@b && git config user.name a \
+  && git commit -q --allow-empty -m init )
+printf 'exit 0\n' > "$fp/out-tests/passes-on-base.sh"   # F2P violation: green before any work
+printf 'exit 1\n' > "$fp/out-tests/fails-on-base.sh"    # correct F2P: red until implemented
+printf '[{"name":"s1","paths":["src/"],"brief":"b","tests":["tests/fails-on-base.sh"]}]' > "$fp/ok.json"
+printf '[{"name":"s1","paths":["src/"],"brief":"b","tests":["tests/passes-on-base.sh"]}]' > "$fp/bad.json"
+( export LOOP_PROJECT="$fp" F2P_CHECK_CMD='bash'; source "$CTL/lib.sh"
+  f2p_preflight "$fp/ok.json" "$fp/out-tests" ) >/dev/null 2>&1 \
+  && ok "f2p_preflight: failing-on-base contract test accepted" \
+  || ko "f2p_preflight: rejected a correct F2P test"
+if out="$( export LOOP_PROJECT="$fp" F2P_CHECK_CMD='bash'; source "$CTL/lib.sh"
+           f2p_preflight "$fp/bad.json" "$fp/out-tests" 2>&1 )"; then
+  ko "f2p_preflight: accepted a test that passes on base"
+else
+  printf '%s' "$out" | grep -q 'F2P violation' \
+    && ok "f2p_preflight: already-passing contract test rejected with reason" \
+    || ko "f2p_preflight: wrong error ($out)"
+fi
+( export LOOP_PROJECT="$fp"; source "$CTL/lib.sh"
+  f2p_preflight "$fp/bad.json" "$fp/out-tests" ) >/dev/null 2>&1 \
+  && ok "f2p_preflight: empty F2P_CHECK_CMD -> off (advisory pass)" \
+  || ko "f2p_preflight: ran despite empty F2P_CHECK_CMD"
+git -C "$fp/canonical" worktree list --porcelain 2>/dev/null | grep -q '/f2p\.' \
+  && ko "f2p_preflight: disposable worktree leaked" \
+  || ok "f2p_preflight: disposable worktree cleaned up"
+rm -rf "$fp"
+
+echo "== land.sh dirty-canonical guard =="
+dw="$(mktemp -d)"; touch "$dw/.loop-workspace"; mkdir -p "$dw/state" "$dw/memory"
+mkdir -p "$dw/canonical"; git -C "$dw/canonical" init -q -b main
+( cd "$dw/canonical" && git config user.email a@b && git config user.name a \
+  && echo base > f.txt && git add -A && git commit -qm init \
+  && git checkout -qb work/w1 && echo change > g.txt && git add g.txt && git commit -qm change \
+  && git checkout -q main )
+printf 'TASK=w1\nBRANCH=work/w1\nWORKTREE=%s/none\n' "$dw" > "$dw/state/w1.env"
+echo dirty >> "$dw/canonical/f.txt"
+if out="$( export LOOP_PROJECT="$dw"; bash "$CTL/land.sh" w1 --no-verify 2>&1 )"; then
+  ko "land: merged despite a dirty canonical"
+else
+  printf '%s' "$out" | grep -q 'uncommitted/staged changes' \
+    && ok "land: dirty canonical refused with a loud message" \
+    || ko "land dirty: wrong error ($(printf '%s' "$out" | tail -1))"
+fi
+git -C "$dw/canonical" checkout -q -- f.txt
+if ( export LOOP_PROJECT="$dw"; bash "$CTL/land.sh" w1 --no-verify ) >/dev/null 2>&1 \
+   && [ -f "$dw/canonical/g.txt" ]; then
+  ok "land: clean canonical merges normally after the guard"
+else ko "land clean: merge failed after cleaning"; fi
+
+echo "== verify -> land freshness token (skip the redundant re-gate) =="
+# New worker branch on the same fixture: verify PASS writes the (base, branch) token; an
+# immediate land skips the duplicate gate run; any new commit invalidates the token.
+( cd "$dw/canonical" && git checkout -qb work/w2 && echo w2 > h.txt && git add h.txt \
+  && git commit -qm w2 && git checkout -q main )
+printf 'TASK=w2\nBRANCH=work/w2\nWORKTREE=%s/none\n' "$dw" > "$dw/state/w2.env"
+( export LOOP_PROJECT="$dw" SECOND_OPINION=off; bash "$CTL/verify.sh" w2 ) >/dev/null 2>&1 \
+  && [ -f "$dw/state/w2.verified" ] \
+  && ok "verify: PASS writes the freshness token" \
+  || ko "verify: no freshness token after PASS"
+out="$( export LOOP_PROJECT="$dw" SECOND_OPINION=off; bash "$CTL/land.sh" w2 2>&1 )" || true
+if printf '%s' "$out" | grep -q 'skipping the redundant re-gate' && [ -f "$dw/canonical/h.txt" ]; then
+  ok "land: fresh verify PASS skips the re-gate and merges"
+else ko "land freshness: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')"; fi
+[ ! -f "$dw/state/w2.verified" ] \
+  && ok "land: freshness token consumed on merge" \
+  || ko "land: freshness token survived the merge"
+# Stale token: verify, then move the branch — land must re-gate (token sha mismatch).
+( cd "$dw/canonical" && git checkout -qb work/w3 && echo w3 > i.txt && git add i.txt \
+  && git commit -qm w3 && git checkout -q main )
+printf 'TASK=w3\nBRANCH=work/w3\nWORKTREE=%s/none\n' "$dw" > "$dw/state/w3.env"
+( export LOOP_PROJECT="$dw" SECOND_OPINION=off; bash "$CTL/verify.sh" w3 ) >/dev/null 2>&1 || true
+( cd "$dw/canonical" && git checkout -q work/w3 && echo more >> i.txt && git add i.txt \
+  && git commit -qm more && git checkout -q main )
+out="$( export LOOP_PROJECT="$dw" SECOND_OPINION=off; bash "$CTL/land.sh" w3 2>&1 )" || true
+if printf '%s' "$out" | grep -q 'GATE:' && ! printf '%s' "$out" | grep -q 'skipping the redundant re-gate'; then
+  ok "land: stale token (new commit) re-runs the gate"
+else ko "land stale token: $(printf '%s' "$out" | head -2 | tr '\n' ' ')"; fi
+rm -rf "$dw"
 
 echo "== lib: progress_compact (bounded PROGRESS.md) =="
 if ( export LOOP_PROJECT="$ws" PROGRESS_MAX_LINES=50 PROGRESS_KEEP_LINES=10
@@ -983,6 +1136,84 @@ mb="$(git -C "$lr" merge-base main work/w1)"
 ( cd "$lr" && GATE_MERGE_BASE="$mb" GATE_BRANCH=work/w1 bash "$pw/gate.d/frontend-humble-object-20-no-e2e.sh" ) >/dev/null 2>&1; rc=$?
 [ "$rc" = 1 ] && ok "20-no-e2e: added e2e/ file fails the gate" \
              || ko "20-no-e2e: expected 1 got $rc"
+
+echo "== harness.sh (external pack intake, pack spec v1) =="
+# A well-formed external pack: frontmatter contract, one L2 guard + selftest fixtures,
+# an L3 check and its config template. Guard reads its regex from ../gate.d/ exactly like
+# shipped-pack guards (one source of truth), so the staged selftest also proves that layout.
+xproot="$(mktemp -d)"; xp="$xproot/extpack"
+mkdir -p "$xp/guards" "$xp/selftest" "$xp/check.d" "$xp/config"
+cat > "$xp/pack.md" <<'EOF'
+---
+enforces: no files named forbidden.* (test fixture)
+when-to-remove: fixture pack — remove immediately
+origin: tests-toolkit/run.sh
+requires: nothing (fixture)
+---
+# extpack — external intake fixture
+EOF
+printf -- '- fixture rule: never create forbidden.* files\n' > "$xp/RULES.snippet.md"
+cat > "$xp/guards/guard-forbid" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+CFG="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/gate.d/extpack.env"
+FORBID_REGEX=''
+[ -f "$CFG" ] && source "$CFG"
+[ -n "$FORBID_REGEX" ] || exit 0
+grep -qE "\"file_path\"[^,}]*$FORBID_REGEX" - && { echo "blocked" >&2; exit 2; }
+exit 0
+EOF
+echo 'FORBID_REGEX="forbidden\."' > "$xp/config/extpack.env"
+printf '{"tool_name":"Write","tool_input":{"file_path":"/wt/src/forbidden.ts"}}' > "$xp/selftest/guard-forbid.block.exit2.json"
+printf '{"tool_name":"Write","tool_input":{"file_path":"/wt/src/allowed.ts"}}'   > "$xp/selftest/guard-forbid.allow.exit0.json"
+echo 'exit 0' > "$xp/check.d/50-extpack.sh"
+hns apply "$xp" > "$pw/ext.out" 2>&1 \
+  && ok "external pack: adopted from a directory path" \
+  || ko "external pack apply failed: $(tail -3 "$pw/ext.out" | tr '\n' ' ')"
+grep -q '2 case(s) passed' "$pw/ext.out" \
+  && ok "external pack: selftest ran before adoption (2 cases)" \
+  || ko "external pack: selftest did not run ($(grep -i selftest "$pw/ext.out" | head -1))"
+grep -q 'origin  : tests-toolkit' "$pw/ext.out" && grep -q 'requires: nothing' "$pw/ext.out" \
+  && ok "external pack: origin/requires surfaced at the door" \
+  || ko "external pack: provenance lines missing"
+[ -x "$pw/worker-harness.d/extpack-guard-forbid" ] && [ -f "$pw/gate.d/extpack-50-extpack.sh" ] \
+  && [ -f "$pw/gate.d/extpack.env" ] && grep -q 'loop-pack: extpack/rules' "$pw/skills/RULES.md" \
+  && ok "external pack: artifacts land in the same seams as shipped packs" \
+  || ko "external pack: artifacts missing from workspace seams"
+printf '{"tool_name":"Write","tool_input":{"file_path":"/wt/src/forbidden.ts"}}' \
+  | HARNESS_WORKTREE=/wt bash "$pw/worker-harness.d/extpack-guard-forbid" >/dev/null 2>&1; rc=$?
+[ "$rc" = 2 ] && ok "external pack: installed guard enforces via installed config (exit 2)" \
+             || ko "external pack: installed guard inert (expected 2 got $rc)"
+# Spec enforcement at the door: a guard with NO selftest case is refused, nothing installed.
+xb="$xproot/badpack"; mkdir -p "$xb/guards"
+printf -- '---\nenforces: x\nwhen-to-remove: x\n---\n' > "$xb/pack.md"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$xb/guards/guard-untested"
+if hns apply "$xb" >/dev/null 2>&1; then
+  ko "external pack: guard without selftest was adopted (must be refused)"
+else
+  [ ! -e "$pw/worker-harness.d/badpack-guard-untested" ] \
+    && ok "external pack: unverified guard refused, nothing installed" \
+    || ko "external pack: refused pack still left artifacts"
+fi
+# A LYING selftest (guard does not behave as the fixture claims) aborts before install.
+xl="$xproot/liarpack"; mkdir -p "$xl/guards" "$xl/selftest"
+printf -- '---\nenforces: x\nwhen-to-remove: x\n---\n' > "$xl/pack.md"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$xl/guards/guard-liar"
+printf '{"tool_name":"Write","tool_input":{"file_path":"/wt/x"}}' > "$xl/selftest/guard-liar.block.exit2.json"
+if hns apply "$xl" >/dev/null 2>&1; then
+  ko "external pack: failing selftest was adopted (must abort)"
+else
+  [ ! -e "$pw/worker-harness.d/liarpack-guard-liar" ] \
+    && ok "external pack: failing selftest aborts adoption pre-install" \
+    || ko "external pack: failed selftest still installed the guard"
+fi
+# Missing when-to-remove: the removability contract is mandatory for external packs.
+xw="$xproot/nowtr"; mkdir -p "$xw"
+printf -- '---\nenforces: x\n---\n' > "$xw/pack.md"
+hns apply "$xw" >/dev/null 2>&1 \
+  && ko "external pack: missing when-to-remove accepted" \
+  || ok "external pack: missing when-to-remove refused"
+rm -rf "$xproot"
 rm -rf "$lr" "$pw"
 
 echo "== design SSOT direct-read (plan.sh wiring) =="
@@ -1102,6 +1333,49 @@ if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'DONE'; then
 else ko "loop guard ok-path: rc=$rc ($(printf '%s' "$out" | tail -2 | tr '\n' ' '))"; fi
 rm -rf "$lw"
 
+echo "== loop.sh crash-restart reconciliation (assignment ledger) =="
+# Run 1: PLANNER_ENABLED=0 + human slices -> the loop assigns s1 to w1 and persists the ledger;
+# we kill it mid-goal (timeout) to simulate a heartbeat crash.
+lr2="$(mktemp -d)"; mkdir -p "$lr2/ws/memory/slices" "$lr2/home"
+touch "$lr2/ws/.loop-workspace"
+mkdir -p "$lr2/ws/canonical"; git -C "$lr2/ws/canonical" init -q -b main
+git -C "$lr2/ws/canonical" -c user.email=a@b -c user.name=a commit -q --allow-empty -m init
+printf '# Backlog\n\n- [ ] goalX\n' > "$lr2/ws/memory/backlog.md"
+printf '[{"name":"s1","paths":["src/"],"brief":"do X"}]\n' > "$lr2/ws/memory/slices/current.json"
+out="$( export LOOP_PROJECT="$lr2/ws" HOME="$lr2/home" CLAUDE_CODE_OAUTH_TOKEN=dummy \
+               WORKER_COUNT=1 PLANNER_ENABLED=0 LOOP_POLL_SECS=1
+        timeout 8 bash "$CTL/loop.sh" 2>&1 )" || true
+jq -e '.busy.w1.slice=="s1" and (.queue|length)==0' "$lr2/ws/state/loop-active.json" >/dev/null 2>&1 \
+  && ok "loop restart: ledger persisted on assign (busy w1 <- s1)" \
+  || ko "loop restart: ledger missing/wrong ($(cat "$lr2/ws/state/loop-active.json" 2>/dev/null))"
+ls "$lr2/ws/memory/slices/current.json.consumed-"* >/dev/null 2>&1 && [ ! -f "$lr2/ws/memory/slices/current.json" ] \
+  && ok "loop: PLANNER_ENABLED=0 slices file archived after consumption" \
+  || ko "loop: consumed slices file not archived"
+grep -qxF -- '- [~] goalX' "$lr2/ws/memory/backlog.md" \
+  && ok "loop restart: crashed run leaves the goal marked [~]" \
+  || ko "loop restart: goal mark wrong ($(grep goalX "$lr2/ws/memory/backlog.md"))"
+# Between runs: tamper the worker's task brief with a sentinel (re-assignment would overwrite
+# it) and add an orphan [~] goal (a run that died before assigning — must still be reset).
+printf 'SENTINEL-DO-NOT-CLOBBER\n' > "$lr2/ws/state/workers/w1/harness/task.md"
+printf -- '- [~] orphan goal\n' >> "$lr2/ws/memory/backlog.md"
+# Run 2: the restarted loop must RESTORE (goal + busy w1), not re-plan/re-assign.
+out2="$( export LOOP_PROJECT="$lr2/ws" HOME="$lr2/home" CLAUDE_CODE_OAUTH_TOKEN=dummy \
+                WORKER_COUNT=1 PLANNER_ENABLED=0 LOOP_POLL_SECS=1 AGENT_UNKNOWN_GRACE=99
+         timeout 6 bash "$CTL/loop.sh" 2>&1 )" || true
+printf '%s' "$out2" | grep -q 'restored in-flight goal' \
+  && ok "loop restart: ledger restored on start" \
+  || ko "loop restart: no restore ($(printf '%s' "$out2" | head -3 | tr '\n' ' '))"
+if ! printf '%s' "$out2" | grep -qE 'next goal|assign w1'; then
+  ok "loop restart: no re-plan / re-assign while the slice is in flight"
+else ko "loop restart: re-planned or re-assigned ($(printf '%s' "$out2" | grep -E 'next goal|assign' | head -2 | tr '\n' ' '))"; fi
+grep -qxF 'SENTINEL-DO-NOT-CLOBBER' "$lr2/ws/state/workers/w1/harness/task.md" \
+  && ok "loop restart: in-flight worker's task.md untouched" \
+  || ko "loop restart: task.md was overwritten"
+grep -qxF -- '- [~] goalX' "$lr2/ws/memory/backlog.md" && grep -qxF -- '- [ ] orphan goal' "$lr2/ws/memory/backlog.md" \
+  && ok "loop restart: restored goal stays [~], orphan goal reset to [ ]" \
+  || ko "loop restart: backlog reconciliation wrong ($(grep -E 'goalX|orphan' "$lr2/ws/memory/backlog.md" | tr '\n' ' '))"
+rm -rf "$lr2"
+
 echo "== planner + engine wiring (static contracts) =="
 grep -q 'ontology/digest.md' "$CTL/plan.sh" \
   && ok "plan.sh: planner reads the ontology digest when present" \
@@ -1109,6 +1383,34 @@ grep -q 'ontology/digest.md' "$CTL/plan.sh" \
 grep -q 'F2P' "$CTL/plan.sh" && grep -q 'P2P' "$CTL/plan.sh" \
   && ok "plan.sh: contract tests carry the F2P/P2P framing" \
   || ko "plan.sh: F2P/P2P framing missing"
+# The contract-test commit must be pathspec-scoped: a bare `git commit` sweeps whatever the
+# supervisor left staged in canonical (supervise mode runs with cwd=canonical).
+grep -qE 'commit -q -m "contract tests[^"]*" -- tests/' "$CTL/plan.sh" \
+  && ok "plan.sh: contract-test commit is pathspec-scoped (-- tests/)" \
+  || ko "plan.sh: contract-test commit not scoped to tests/"
+grep -q 'f2p_preflight "$slices"' "$CTL/plan.sh" \
+  && ok "plan.sh: F2P preflight wired before the contract-test commit" \
+  || ko "plan.sh: f2p_preflight not wired"
+# Fresh assignment resets spent per-slice state (codex budget + verify token): an ESCALATED
+# slice never lands, so land.sh's reset alone leaks both into the worker's next slice.
+grep -q 'codex_rounds_reset "$TASK"' "$CTL/assign.sh" && grep -q '\.verified' "$CTL/assign.sh" \
+  && ok "assign.sh: codex rounds + verify token reset on new assignment" \
+  || ko "assign.sh: spent per-slice state leaks across assignments"
+# watch.sh: one in-flight gate per task, and codex-only exit 7 is not reported as a gate FAIL.
+grep -q 'GATEPID' "$CTL/watch.sh" \
+  && ok "watch.sh: per-task in-flight gate guard present" \
+  || ko "watch.sh: concurrent verifies on one task possible"
+grep -q 'CONCERNS' "$CTL/watch.sh" \
+  && ok "watch.sh: exit 7 (codex concerns) reported distinctly from gate FAIL" \
+  || ko "watch.sh: exit 7 misreported as FAIL"
+# Honest goal completion: all-escalated goals are marked [!], never a silent [x].
+grep -q 'GOAL_INCOMPLETE' "$CTL/loop.sh" && grep -q "mark_goal '!'" "$CTL/loop.sh" \
+  && ok "loop.sh: all-escalated goal marked [!] (GOAL_INCOMPLETE)" \
+  || ko "loop.sh: escalated-only goal still marked [x]"
+# Burst gating is the SHARED lib decision in both heartbeats (no drifting copies).
+grep -q 'gate_now_decision' "$CTL/loop.sh" && grep -q 'gate_now_decision' "$CTL/watch.sh" \
+  && ok "loop.sh + watch.sh: burst gating via shared gate_now_decision" \
+  || ko "burst gating still duplicated"
 grep -q 'F2P' "$CTL/verify.sh" \
   && ok "verify.sh: feedback explains F2P vs P2P failures" \
   || ko "verify.sh: F2P/P2P explanation missing"

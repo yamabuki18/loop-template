@@ -60,17 +60,8 @@ if [ -f "$CONFIG_DIR/CLAUDE.worker.local.md" ]; then
   { echo; echo "# Project-specific rules (workspace overlay)"; echo;
     cat "$CONFIG_DIR/CLAUDE.worker.local.md"; } >> "$CD/CLAUDE.md"
 fi
-if [ ! -f "$CD/.claude.json" ]; then
-  sed "s|__WORKTREE__|$WT|g" "$CONTROL_DIR/worker-claude.template.json" > "$CD/.claude.json"
-fi
-# Host-login convenience: with no worker-scope secret, ride the operator's own claude login by
-# copying its credential into the isolated config dir (auth_mode 'host'). Concealment tradeoff
-# is the operator's own credential — doctor points at `loop secrets edit worker` for the clean way.
-if ! secret_present worker && [ -f "$HOME/.claude/.credentials.json" ] && [ ! -f "$CD/.credentials.json" ]; then
-  cp "$HOME/.claude/.credentials.json" "$CD/.credentials.json"
-  chmod 600 "$CD/.credentials.json" 2>/dev/null || true
-  echo "spawn: no worker-scope secret — seeded '$TASK' from the host claude login (see: loop secrets edit worker)"
-fi
+# Onboarding pre-seed + host-login convenience (shared seam: lib.sh claude_cfg_seed).
+claude_cfg_seed "$CD" "$WT"
 
 # 3) Record state for the other scripts.
 mkdir -p "$STATE_DIR"

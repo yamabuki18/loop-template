@@ -119,15 +119,8 @@ if [ -d "$CONTROL_DIR/supervisor-skills" ]; then
   cp -r "$CONTROL_DIR/supervisor-skills" "$SCD/skills"
 fi
 
-# Onboarding pre-seed (only when missing — .claude.json accumulates live session state).
-if [ ! -f "$SCD/.claude.json" ]; then
-  sed "s|__WORKTREE__|$CANONICAL|g" "$CONTROL_DIR/worker-claude.template.json" > "$SCD/.claude.json"
-fi
-# Host-login convenience, mirroring spawn.sh.
-if ! secret_present worker && [ -f "$HOME/.claude/.credentials.json" ] && [ ! -f "$SCD/.credentials.json" ]; then
-  cp "$HOME/.claude/.credentials.json" "$SCD/.credentials.json"
-  chmod 600 "$SCD/.credentials.json" 2>/dev/null || true
-fi
+# Onboarding pre-seed + host-login convenience (shared seam: lib.sh claude_cfg_seed).
+claude_cfg_seed "$SCD" "$CANONICAL"
 
 claude_args=()
 [ -n "${SUPERVISOR_MODEL:-}" ] && claude_args+=(--model "$SUPERVISOR_MODEL")

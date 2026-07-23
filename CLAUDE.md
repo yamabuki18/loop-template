@@ -27,7 +27,9 @@ loop/
     secrets.sh        sops+age の秘密管理（init/edit/status/migrate）
     spawn.sh / worker-run.sh   ワーカー worktree + herdr ペイン + 資格情報注入の seam
     harness.sh        `loop harness`: 導入時に方針パックを対話/非対話で既存シームへ取込
-                      （L1 snippets / L2 worker-harness.d / L3 gate.d — 新概念は作らない）
+                      （L1 snippets / L2 worker-harness.d / L3 gate.d — 新概念は作らない）。
+                      外部産パックは apply <dir>（pack spec v1: frontmatter 契約 +
+                      L2 ガードの selftest をインストール前に検証。packs/README.md が仕様の正）
     ontology-check.sh AIF イベントオントロジー（memory/ontology/graph.jsonl）の決定論検証
     worker-harness/   ワーカーの Claude Code フック（決定論ガード。settings.template.json）
     host-harness/     任意の対話監督 Claude 用の保険フック

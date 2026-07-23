@@ -24,6 +24,12 @@ st="$(agent_state "$TASK")"
 HD="$(harness_dir "$TASK")"
 mkdir -p "$HD"
 printf '%s\n' "${prefixes[@]}" > "$HD/owned-paths"
+# Fresh assignment = fresh codex-round budget. land.sh also resets, but an ESCALATED slice
+# never lands — without this, the next slice on the same worker would inherit a spent budget
+# and codex high-severity concerns would silently pass. Same for the verify freshness token:
+# it certifies the PREVIOUS slice's (base, branch) pair, not this one.
+codex_rounds_reset "$TASK"
+rm -f "$STATE_DIR/$TASK.verified" 2>/dev/null || true
 echo "ownership domain for '$TASK':"; printf '  %s\n' "${prefixes[@]}"
 echo "edits outside these prefixes (and anywhere under $PROTECTED_PATHS) are blocked by the harness."
 

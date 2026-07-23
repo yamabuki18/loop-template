@@ -23,16 +23,32 @@ source "$STATE_DIR/$TASK.env"
 if [ "$NO_VERIFY" -eq 1 ]; then
   echo "land: --no-verify set, SKIPPING acceptance gate (supervisor override)."
 else
-  "$CONTROL_DIR/gate.sh" "$TASK" \
-    || die "acceptance gate failed — merge aborted. Fix on the worker and re-verify, or override with: ./control/land.sh $TASK --no-verify"
+  # Freshness token (written by verify.sh on PASS): if neither base nor branch moved since the
+  # last full verify, re-running the gate here is a pure duplicate — skip it. Any new commit,
+  # rebase, or other land changes a sha and invalidates the token.
+  vf="$STATE_DIR/$TASK.verified"
+  cur="$(git -C "$CANONICAL" rev-parse "$BASE_BRANCH" 2>/dev/null || echo '?') $(git -C "$CANONICAL" rev-parse "$BRANCH" 2>/dev/null || echo '??')"
+  if [ -f "$vf" ] && [ "$(cat "$vf" 2>/dev/null)" = "$cur" ]; then
+    echo "land: verify PASS is fresh (base and branch unchanged since the last gate) — skipping the redundant re-gate."
+  else
+    "$CONTROL_DIR/gate.sh" "$TASK" \
+      || die "acceptance gate failed — merge aborted. Fix on the worker and re-verify, or override with: ./control/land.sh $TASK --no-verify"
+  fi
 fi
+
+# The merge below operates on canonical's index/worktree — in supervise mode the supervisor
+# Claude works with cwd=canonical, so a mid-edit (dirty or staged) canonical is a real state.
+# Fail loud instead of letting the checkout die inscrutably or the merge sweep stray changes.
+git -C "$CANONICAL" diff --quiet && git -C "$CANONICAL" diff --cached --quiet \
+  || die "canonical has uncommitted/staged changes — commit or stash them in $CANONICAL before landing (the merge would sweep them in)."
 
 git -C "$CANONICAL" checkout -q "$BASE_BRANCH"
 git -C "$CANONICAL" merge --no-ff -m "merge $BRANCH" "$BRANCH"
 echo "merged $BRANCH into $BASE_BRANCH (canonical)."
 
-# This slice's codex-round budget is spent state — reset it for the next assignment.
+# This slice's codex-round budget and verify freshness token are spent state — clear both.
 codex_rounds_reset "$TASK"
+rm -f "$STATE_DIR/$TASK.verified" 2>/dev/null || true
 
 # Record the acceptance in the event ontology (PA node closes this task's open CA nodes in the
 # digest) and refresh the planner-readable digest. Both best-effort, rc-0 contract.
