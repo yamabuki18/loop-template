@@ -379,6 +379,17 @@ jq -e '.hooks.PreToolUse[0].hooks[0].command | endswith("host-harness/harness-gu
    "$svd/settings.json" >/dev/null 2>&1 \
   && ok "supervise: host-harness secrets guard wired by absolute path" \
   || ko "supervise: secrets guard missing from supervisor settings"
+# Supervisor-only skills: deployed into the isolated config dir, and NOWHERE the loop's
+# planner/worker could pick them up (design stays in the dialogue; artifacts flow via plans).
+[ -f "$svd/skills/test-architecture-design/SKILL.md" ] \
+  && ok "supervise: supervisor-skills synced into CLAUDE_CONFIG_DIR/skills" \
+  || ko "supervise: test-architecture-design skill not deployed to $svd/skills"
+grep -q 'テスト設計表を計画本文に含めて' "$svd/skills/test-architecture-design/SKILL.md" 2>/dev/null \
+  && ok "supervise: skill carries the loop-mapping section (plan-capture handoff)" \
+  || ko "supervise: loop-mapping section missing from deployed skill"
+[ ! -e "$sx/ws/canonical/.claude/skills" ] && [ ! -e "$scd/skills/test-architecture-design" ] \
+  && ok "supervise: skill NOT leaked into canonical repo or worker config (loop-separated)" \
+  || ko "supervise: supervisor skill leaked outside the supervisor session"
 
 echo "== plan-mode handoff (plan capture hook + handoff.sh) =="
 PLANCAP="$CTL/host-harness/harness-plan-capture"

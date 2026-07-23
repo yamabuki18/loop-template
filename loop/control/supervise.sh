@@ -110,6 +110,15 @@ cat > "$SCD/settings.json" <<EOF
   }
 }
 EOF
+# Supervisor-only skills (e.g. test-architecture-design), synced into the isolated config dir
+# each run like CLAUDE.md/settings.json so engine updates propagate. This is the ONLY place
+# these skills are deployed: planner/worker worktrees never see them — design happens in this
+# dialogue, and only its artifacts (the captured plan) flow into the loop.
+rm -rf "$SCD/skills"
+if [ -d "$CONTROL_DIR/supervisor-skills" ]; then
+  cp -r "$CONTROL_DIR/supervisor-skills" "$SCD/skills"
+fi
+
 # Onboarding pre-seed (only when missing — .claude.json accumulates live session state).
 if [ ! -f "$SCD/.claude.json" ]; then
   sed "s|__WORKTREE__|$CANONICAL|g" "$CONTROL_DIR/worker-claude.template.json" > "$SCD/.claude.json"

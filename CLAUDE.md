@@ -15,7 +15,10 @@ loop/
                       herdr helper・codex policy の唯一の起点
     loop.sh           完全自律オーケストレータ（心拍）。watch.sh は半自律版
     supervise.sh      対話監督モード（= loop supervise）: watch ペイン + SUPERVISOR_MODEL の
-                      対話 Claude（CLAUDE.supervisor.md + 生成環境情報を CLAUDE.md に注入）
+                      対話 Claude（CLAUDE.supervisor.md + 生成環境情報を CLAUDE.md に注入。
+                      supervisor-skills/ を CLAUDE_CONFIG_DIR/skills へ同期）
+    supervisor-skills/ 監督セッション専用スキル（test-architecture-design）。planner/worker
+                      には非配布 — テスト設計は対話で行い、計画捕捉→handoff でループへ流す
     plan.sh           ヘッドレス計画役 Claude（使い捨て worktree）を回し slices.json を得る
     handoff.sh        plan mode 承認済み計画 → backlog ゴール化（host-harness/harness-plan-capture
                       が ExitPlanMode で計画を memory/plans/latest.md へ捕捉する）
