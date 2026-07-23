@@ -115,7 +115,7 @@ if ! git -C "$WT" -c user.name=gate -c user.email=gate@local merge --no-ff -q "$
   exit 3
 fi
 
-# Checks on the merged tree. Gate-scope secrets (secret.gate.sops.env) are injected ONLY into
+# Checks on the merged tree. Gate-scope secrets (secret.gate.env) are injected ONLY into
 # this deterministic child process — they never enter any Claude process.
 if [ -f "$WT/harness/check.sh" ]; then
   echo "GATE: running harness/check.sh"

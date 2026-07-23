@@ -10,7 +10,7 @@ source "$(dirname "$0")/lib.sh"
 command -v herdr >/dev/null 2>&1 || die "herdr not found — install it: curl -fsSL https://herdr.dev/install.sh | sh"
 have_credential \
   && echo "auth: $(auth_mode) mode" \
-  || echo "WARNING: no credential — workers can't run Claude. Run: claude setup-token, then: loop secrets edit worker"
+  || echo "WARNING: no credential — workers can't run Claude. Run: claude setup-token, then paste it into secret.worker.env"
 
 mkdir -p "$STATE_DIR"
 
@@ -53,9 +53,7 @@ if ! herdr agent get loop >/dev/null 2>&1; then
 fi
 
 # Bring up the default pool of workers (idempotent).
-for i in $(seq 1 "$WORKER_COUNT"); do
-  "$CONTROL_DIR/spawn.sh" "w$i" >/dev/null
-done
+spawn_pool
 
 echo "attaching to herdr (workspace '${ws:-?}' / $PROJECT_NAME). goals: $MEMORY_DIR/backlog.md"
 echo "  full autonomy: press Enter in the 'loop' pane  |  dialogue mode: run 'loop supervise' in a terminal"

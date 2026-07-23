@@ -70,7 +70,7 @@ render() {
       idle)    stcol="$GRN"; st="● idle" ;;
       working) stcol="$YLW"; st="● working" ;;
       blocked) stcol="$RED"; st="● blocked" ;;
-      done)    stcol="$CYN"; st="● done" ;;
+      "done")  stcol="$CYN"; st="● done" ;;   # quoted: SC1010 misreads a bare done) pattern
       none)    stcol="$RED"; st="○ gone" ;;
       *)       stcol="$DIM"; st="○ $st" ;;
     esac

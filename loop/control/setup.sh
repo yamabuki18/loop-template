@@ -22,12 +22,13 @@ command -v jq    >/dev/null 2>&1 || die "jq not found (required by hooks and the
 command -v claude >/dev/null 2>&1 || echo "  WARNING: claude CLI not found — planner/workers cannot run."
 command -v herdr >/dev/null 2>&1 || echo "  WARNING: herdr not found — install: curl -fsSL https://herdr.dev/install.sh | sh"
 
-echo "[2/5] secrets (sops+age) ..."
-if [ "$SECRET_BACKEND" = sops ] && command -v sops >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1; then
-  "$CONTROL_DIR/secrets.sh" init --if-needed || true
-else
-  echo "  NOTE: sops/age not ready — set up later with: loop secrets init   (doctor.sh has details)"
-fi
+echo "[2/5] secrets (plaintext scope files) ..."
+# Seed missing secret.<scope>.env from the engine templates (no-clobber; gitignored).
+for s in worker gate codex; do
+  if [ ! -e "$(secret_file "$s")" ] && [ -f "$CONTROL_DIR/secret.$s.env.example" ]; then
+    cp "$CONTROL_DIR/secret.$s.env.example" "$(secret_file "$s")"
+  fi
+done
 
 echo "[3/5] creating directories ..."
 mkdir -p "$STATE_DIR" "$WORKTREES_DIR" "$REVIEW_DIR" "$LOG_DIR" "$SKILLS_DIR" "$MEMORY_DIR"
@@ -63,5 +64,5 @@ repo_map_refresh   # first structural map for the planner (kept fresh by every l
 
 echo "[5/5] preflight ..."
 "$CONTROL_DIR/doctor.sh" --quick || true
-secret_present worker || echo "  NOTE: add your Claude credential:  claude setup-token && loop secrets edit worker"
+have_credential || echo "  NOTE: add your Claude credential:  claude setup-token, then paste it into $(secret_file worker)"
 echo "  Write goals in memory/backlog.md, then start:   ./control/up.sh"

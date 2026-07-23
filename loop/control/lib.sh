@@ -54,8 +54,8 @@ SKILLS_DIR="$ROOT/skills"
 MEMORY_DIR="$ROOT/memory"
 LOG_DIR="$STATE_DIR/logs"
 
-# --- load config (no error if absent). Secrets are NEVER sourced into this shell: they stay
-# encrypted at rest and are injected per-scope into exactly one child process by secret_exec().
+# --- load config (no error if absent). Secrets are NEVER sourced into this shell: they are
+# injected per-scope into exactly one child process by secret_exec().
 if [ -f "$CONFIG_DIR/config.env" ]; then source "$CONFIG_DIR/config.env"; fi
 
 : "${PROJECT_NAME:=claudeparallel}"
@@ -136,10 +136,6 @@ if [ -f "$CONFIG_DIR/config.env" ]; then source "$CONFIG_DIR/config.env"; fi
 # capture; this preserves the *.jsonl session logs so a stalled/derailed worker's reasoning can be
 # reconstructed post-hoc. 0 = off (default; the transcripts die with the reaped config dir).
 : "${LOOP_WORKER_TRANSCRIPT:=0}"
-# Secrets backend: sops (default; sops+age, free, no account) | op (1Password CLI) | plain
-# (legacy cleartext env file — doctor warns loudly).
-: "${SECRET_BACKEND:=sops}"
-: "${SOPS_AGE_KEY_FILE:=$HOME/.config/sops/age/keys.txt}"
 # Codex second opinion (independent cross-architecture review). off | advise | block.
 : "${SECOND_OPINION:=advise}"
 : "${SECOND_OPINION_PLAN:=}"     # per-phase override; empty = inherit SECOND_OPINION
@@ -157,22 +153,22 @@ claude_cfg_dir() { echo "$STATE_DIR/workers/$1/claude"; }   # per-worker CLAUDE_
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-# --- secrets (scoped, encrypted at rest, injected into exactly one child process) -------------
+# --- secrets (scoped plaintext env files, injected into exactly one child process) ------------
 # Scopes: worker (the Claude credential), gate (test-time secrets), codex (OPENAI_API_KEY).
-# The file for a scope is secret.<scope>.sops.env (sops backend). A missing scope file is NOT an
+# The file for a scope is secret.<scope>.env — plaintext dotenv, gitignored, NEVER committed.
+# Scope separation is the invariant that survives: gate/codex values never enter a Claude
+# process, and nothing is sourced into the loop's own shell. A missing scope file is NOT an
 # error: secret_exec then runs the command bare (e.g. codex may use its own `codex login`).
-secret_file() {
-  case "$SECRET_BACKEND" in
-    sops)  echo "$CONFIG_DIR/secret.$1.sops.env" ;;
-    op)    echo "$CONFIG_DIR/secret.$1.op.env" ;;
-    plain) echo "$CONFIG_DIR/secret.$1.env" ;;
-    *)     echo "$CONFIG_DIR/secret.$1.sops.env" ;;
-  esac
+secret_file() { echo "$CONFIG_DIR/secret.$1.env"; }
+# "Present" = the file holds at least one non-empty VAR=value line. setup.sh seeds empty
+# templates, so bare file existence must NOT count as a configured secret (it would silently
+# disable the host-login fallback in claude_cfg_seed and the usage-guard probe).
+secret_present() {
+  [ -f "$(secret_file "$1")" ] && grep -qE '^[A-Za-z_][A-Za-z0-9_]*=..*' "$(secret_file "$1")"
 }
-secret_present() { [ -f "$(secret_file "$1")" ]; }
 
-# printf %q-quote every arg into ONE string (sops exec-env historically takes the command as a
-# single shell string; multi-arg only landed in sops >= 3.10 — quote for version robustness).
+# printf %q-quote every arg into ONE string (secret_exec re-execs through `sh -c` so the
+# precedence prelude can run inside the injected env).
 shell_quote() { local out="" a; for a in "$@"; do out+="$(printf '%q' "$a") "; done; printf '%s' "${out% }"; }
 
 # Claude Code auth precedence: if ANTHROPIC_API_KEY is present it WINS and forces metered API
@@ -185,20 +181,16 @@ cred_precedence_prelude() {
 }
 
 # secret_exec <scope> -- <cmd> [args...] — run cmd with that scope's secrets in its env ONLY.
-# No scope file -> run bare. All backends route through `sh -c` so the precedence prelude and
-# the version-robust single-string sops contract are identical everywhere.
+# No scope file -> run bare. The subshell sources the dotenv with allexport, then re-execs
+# through `sh -c` so the precedence prelude runs inside the injected env; the parent shell
+# never sees the values.
 secret_exec() {
   local scope="$1"; shift
   [ "${1:-}" = "--" ] && shift
   local f; f="$(secret_file "$scope")"
   if [ ! -f "$f" ]; then "$@"; return; fi
   local script; script="$(cred_precedence_prelude "$scope")exec $(shell_quote "$@")"
-  case "$SECRET_BACKEND" in
-    sops)  SOPS_AGE_KEY_FILE="$SOPS_AGE_KEY_FILE" sops exec-env "$f" "$script" ;;
-    op)    op run --env-file="$f" -- sh -c "$script" ;;
-    plain) ( set -a; . "$f"; set +a; exec sh -c "$script" ) ;;
-    *)     die "unknown SECRET_BACKEND '$SECRET_BACKEND' (sops|op|plain)" ;;
-  esac
+  ( set -a; . "$f"; set +a; exec sh -c "$script" )
 }
 
 # --- credential / billing mode -----------------------------------------------------------------
@@ -283,6 +275,13 @@ worker_tasks() {
   for f in "$STATE_DIR"/*.env; do
     t="$(basename "$f" .env)"; echo "$t"
   done
+}
+
+# Bring up the default worker pool w1..wN (idempotent — spawn.sh no-ops on a live worker).
+# The ONE implementation shared by loop.sh / up.sh / supervise.sh (three copies before).
+spawn_pool() {
+  local n="${1:-$WORKER_COUNT}" i
+  for i in $(seq 1 "$n"); do "$CONTROL_DIR/spawn.sh" "w$i" >/dev/null; done
 }
 
 # UTC timestamp (no Math.random/Date restrictions here — this is bash).
@@ -384,7 +383,7 @@ gate_now_decision() { # <head> <seen> <agent-state> <unknown-count>
   if [ "$h" = "$seen" ] || [ "$h" = none ]; then echo "none $unk"; return 0; fi
   case "$st" in
     working)           echo "wait 0"; return 0 ;;
-    idle|blocked|done) echo "gate 0"; return 0 ;;
+    idle|blocked|"done") echo "gate 0"; return 0 ;;   # quoted: SC1010 misreads a bare done) pattern
   esac
   unk=$((unk + 1))
   if [ "$unk" -lt "${AGENT_UNKNOWN_GRACE:-6}" ]; then echo "defer $unk"; else echo "force 0"; fi
@@ -752,6 +751,11 @@ ontology_digest_refresh() {
   local g="$MEMORY_DIR/ontology/graph.jsonl"
   [ -s "$g" ] || return 0
   command -v jq >/dev/null 2>&1 || return 0
+  # Validate right before deriving — a malformed graph would otherwise poison the digest the
+  # planner reads. Warn-only (rc-0 contract): the ontology is advisory memory, never a blocker.
+  if ! bash "$CONTROL_DIR/ontology-check.sh" "$g" >/dev/null 2>&1; then
+    progress_log ONTOLOGY_INVALID "-" "-" "graph.jsonl violates the upper ontology — inspect with: loop ontology-check" 2>/dev/null || true
+  fi
   local tmp; tmp="$(mktemp)"
   {
     echo "# Ontology digest — auto-generated from memory/ontology/graph.jsonl on every land."
@@ -784,7 +788,7 @@ claude_cfg_seed() { # <cfg-dir> <worktree-path-for-onboarding-template>
   if ! secret_present worker && [ -f "$HOME/.claude/.credentials.json" ] && [ ! -f "$cfg/.credentials.json" ]; then
     cp "$HOME/.claude/.credentials.json" "$cfg/.credentials.json"
     chmod 600 "$cfg/.credentials.json" 2>/dev/null || true
-    echo "note: no worker-scope secret — seeded the host claude login (clean way: loop secrets edit worker)"
+    echo "note: no worker-scope secret — seeded the host claude login (clean way: claude setup-token -> secret.worker.env)"
   fi
   return 0
 }

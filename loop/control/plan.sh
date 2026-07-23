@@ -17,7 +17,7 @@ set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 
 GOAL="${1:?usage: plan.sh \"<goal text>\"}"
-have_credential || die "no credential: run 'claude setup-token' then 'loop secrets edit worker' (or log in to claude on this host)."
+have_credential || die "no credential: run 'claude setup-token' and paste it into secret.worker.env (or log in to claude on this host)."
 [ -d "$CANONICAL/.git" ] || die "canonical not found — run ./control/setup.sh first."
 command -v claude >/dev/null 2>&1 || die "claude CLI not found on the host."
 

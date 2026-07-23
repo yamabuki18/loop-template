@@ -45,7 +45,7 @@ here: attached — the project repo itself was NOT touched (zero footprint).
   workspace : $WS
 
 Daily flow (all runnable from inside the project):
-  1. one-time: claude setup-token && loop secrets init && loop secrets edit worker
+  1. one-time: claude setup-token, then paste the token into the workspace's secret.worker.env
                \$EDITOR $WS/skills/VISION.md ARCHITECTURE.md RULES.md
                loop setup                    # clones canonical from the project (no image build)
   2. \$EDITOR $WS/memory/backlog.md          # write goals

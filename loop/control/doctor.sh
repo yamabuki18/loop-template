@@ -32,7 +32,7 @@ if [ "$QUICK" -eq 0 ]; then
   else
     [ "${SECOND_OPINION:-advise}" = off ] \
       && ok "codex absent, SECOND_OPINION=off (by choice)" \
-      || note "codex CLI absent — second opinion auto-skips (CODEX_SKIP in PROGRESS). Install codex + 'codex login' or 'loop secrets edit codex'."
+      || note "codex CLI absent — second opinion auto-skips (CODEX_SKIP in PROGRESS). Install codex + 'codex login' or set OPENAI_API_KEY in secret.codex.env."
   fi
 
   echo "doctor: layout"
@@ -42,39 +42,27 @@ if [ "$QUICK" -eq 0 ]; then
   esac
 
   echo "doctor: secrets / billing mode"
-  case "$SECRET_BACKEND" in
-    sops)
-      command -v sops >/dev/null 2>&1 && ok "sops" || bad "sops not found (SECRET_BACKEND=sops) — https://github.com/getsops/sops/releases"
-      command -v age-keygen >/dev/null 2>&1 && ok "age" || bad "age not found (SECRET_BACKEND=sops) — apt install age"
-      if [ -f "$SOPS_AGE_KEY_FILE" ]; then
-        perms="$(stat -c '%a' "$SOPS_AGE_KEY_FILE" 2>/dev/null || echo '?')"
-        [ "$perms" = "600" ] && ok "age key present (perms 600)" || note "age key perms are $perms — tighten: chmod 600 $SOPS_AGE_KEY_FILE"
-      else
-        note "no age key yet — run: loop secrets init"
-      fi
-      for s in worker gate codex; do
-        f="$(secret_file "$s")"
-        [ -f "$f" ] || continue
-        if command -v sops >/dev/null 2>&1 && SOPS_AGE_KEY_FILE="$SOPS_AGE_KEY_FILE" sops decrypt "$f" >/dev/null 2>&1; then
-          ok "secret.$s decryptable"
-        else
-          bad "secret.$s present but NOT decryptable with this key ($f)"
-        fi
-      done
-      ;;
-    plain)
-      note "SECRET_BACKEND=plain — PLAINTEXT secrets on a host that RUNS agent processes. Migrate: loop secrets migrate --yes" ;;
-    op)
-      command -v op >/dev/null 2>&1 && ok "1Password CLI (op)" || bad "op not found (SECRET_BACKEND=op)" ;;
-  esac
-  [ -f "$CONFIG_DIR/secret.env" ] && note "legacy v2.2 secret.env still present — migrate: loop secrets migrate --yes"
+  # Plaintext scoped env files (secret.<scope>.env, gitignored). Verify each file that holds
+  # values is not group/world-readable — that is the only at-rest protection left.
+  for s in worker gate codex; do
+    f="$(secret_file "$s")"
+    if secret_present "$s"; then
+      perms="$(stat -c '%a' "$f" 2>/dev/null || echo '?')"
+      case "$perms" in
+        600|400) ok "secret.$s configured (perms $perms)" ;;
+        *)       note "secret.$s configured but perms are $perms — tighten: chmod 600 $f" ;;
+      esac
+    elif [ -f "$f" ]; then
+      note "secret.$s is an empty template — fill in values or leave it (missing scope = run bare)"
+    fi
+  done
   case "$(auth_mode)" in
     subscription) ok "auth = subscription (OAuth token in worker scope → Pro/Max quota, no metered API)" ;;
     api)          ok "auth = api (metered billing)"
-                  note "metered API: a fleet loop can burn many tokens. Prefer 'claude setup-token' + loop secrets edit worker." ;;
+                  note "metered API: a fleet loop can burn many tokens. Prefer 'claude setup-token' -> secret.worker.env." ;;
     host)         ok "auth = host (workers ride this host's claude login)"
-                  note "host login is your PERSONAL credential; for a scoped one: claude setup-token && loop secrets edit worker" ;;
-    none)         note "no credential — run: claude setup-token && loop secrets edit worker (or log in to claude on this host)" ;;
+                  note "host login is your PERSONAL credential; for a scoped one: claude setup-token -> secret.worker.env" ;;
+    none)         note "no credential — run: claude setup-token and paste into secret.worker.env (or log in to claude on this host)" ;;
   esac
 fi
 

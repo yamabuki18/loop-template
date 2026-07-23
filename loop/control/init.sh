@@ -41,9 +41,13 @@ echo "init: creating workspace '$name' in $WS (engine: $ENGINE)"
 # config: the engine's config.env is the documented template; only PROJECT_NAME is customized.
 sed "s/^PROJECT_NAME=.*/PROJECT_NAME=$name       # auto-set by loop init (namespaces the herdr workspace)/" \
   "$CONTROL_DIR/config.env" > "$WS/config.env"
-cp "$CONTROL_DIR/secret.worker.env.example" "$WS/secret.worker.env.example"
-cp "$CONTROL_DIR/secret.gate.env.example"   "$WS/secret.gate.env.example"   2>/dev/null || true
-cp "$CONTROL_DIR/secret.codex.env.example"  "$WS/secret.codex.env.example"  2>/dev/null || true
+# Seed the plaintext scope files from the engine templates (no-clobber; gitignored below).
+for s in worker gate codex; do
+  if [ ! -e "$WS/secret.$s.env" ] && [ -f "$CONTROL_DIR/secret.$s.env.example" ]; then
+    cp "$CONTROL_DIR/secret.$s.env.example" "$WS/secret.$s.env"
+    chmod 600 "$WS/secret.$s.env" 2>/dev/null || true
+  fi
+done
 
 # Project knowledge templates (the loop reads these every cycle — fill them in).
 mkdir -p "$WS/skills" "$WS/memory"
@@ -51,17 +55,12 @@ for f in "$ENGINE"/skills/*.md;  do [ -e "$WS/skills/$(basename "$f")" ] || cp "
 [ -f "$WS/memory/PROGRESS.md" ] || cp "$ENGINE/memory/PROGRESS.md" "$WS/memory/PROGRESS.md"
 [ -f "$WS/memory/backlog.md" ]  || cp "$ENGINE/memory/backlog.md"  "$WS/memory/backlog.md"
 
-# Never let secrets or runtime state get committed from a workspace. Encrypted *.sops.env MAY
-# be committed if your team shares age recipients — opt in by removing those lines (README).
+# Never let secrets or runtime state get committed from a workspace. The secret files are
+# PLAINTEXT — the gitignore is the only thing between them and an accidental commit.
 cat > "$WS/.gitignore" <<'EOF'
 # loop workspace — secrets and runtime state stay out of git
-secret.*.sops.env
-secret.*.op.env
-.sops.yaml
+secret.*.env
 secret.env
-secret.worker.env
-secret.gate.env
-secret.codex.env
 .source-repo
 state/
 worktrees/
@@ -82,8 +81,8 @@ cat <<EOF
 
 init: workspace ready. Next, in $WS:
   1. \$EDITOR config.env                 (BASE_BRANCH, CHECK_CMD, loop knobs — PROJECT_NAME is set)
-  2. claude setup-token && loop secrets init && loop secrets edit worker
-     -> the credential lives sops-encrypted (never a plaintext file)
+  2. claude setup-token, then paste the token into secret.worker.env
+     (plaintext, gitignored; secret.gate.env / secret.codex.env are optional scopes)
   3. \$EDITOR skills/VISION.md skills/ARCHITECTURE.md skills/RULES.md
   4. loop harness                       (optional: adopt methodology packs into the harness/
      gate; keeping a typed design SSOT? point DESIGN_SSOT_DIR at it in config.env)

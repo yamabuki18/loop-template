@@ -11,8 +11,8 @@
 #   loop refresh                 absorb the project's new commits into the loop's base
 #   loop workspaces              list every attached project and its fleet
 #   loop init <dir> [repo-url]   create a standalone workspace directory instead of attaching
-#   loop secrets <sub>           manage sops-encrypted secrets: init | edit <scope> | status |
-#                                migrate --yes   (scopes: worker / gate / codex)
+#   (secrets: plaintext secret.<scope>.env files in the workspace — worker / gate / codex.
+#    Edit them directly; they are gitignored and injected per-scope by secret_exec.)
 #   loop harness [sub]           adopt methodology packs into this workspace's harness/gate:
 #                                wizard (default) | list | apply <pack>... | status
 #                                (packs = L1 snippets + L2 guards + L3 gate.d checks)

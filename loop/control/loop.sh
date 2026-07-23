@@ -21,7 +21,7 @@ set -uo pipefail
 source "$(dirname "$0")/lib.sh"
 
 [ -d "$CANONICAL/.git" ] || die "canonical not found — run ./control/setup.sh first."
-have_credential || die "no credential: run 'claude setup-token' then 'loop secrets edit worker' (or log in to claude on this host)."
+have_credential || die "no credential: run 'claude setup-token' and paste it into secret.worker.env (or log in to claude on this host)."
 # Heartbeat exclusivity: watch.sh (also behind `loop supervise`) drives the same gate — running
 # both double-gates every commit. Claim loop.pid; refuse while a live watch.pid exists.
 if pid="$(heartbeat_pid_alive watch)"; then
@@ -36,7 +36,7 @@ mkdir -p "$LOG_DIR"
 mapfile -t WORKERS < <(worker_tasks)
 if [ "${#WORKERS[@]}" -eq 0 ]; then
   echo "loop: no workers yet — bringing up $WORKER_COUNT (run ./control/up.sh for the herdr view)."
-  for i in $(seq 1 "$WORKER_COUNT"); do "$CONTROL_DIR/spawn.sh" "w$i" >/dev/null; done
+  spawn_pool
   mapfile -t WORKERS < <(worker_tasks)
 fi
 

@@ -1,16 +1,9 @@
-# Secrets — encrypted at rest (sops+age), but still ignored by default. If your whole team
-# shares the age recipients you MAY commit *.sops.env + .sops.yaml (see README) — opt in by
-# removing these lines in YOUR workspace, never in the template.
-secret.*.sops.env
-secret.*.op.env
-.sops.yaml
-# Legacy v2.2 plaintext secrets (migrate with: loop secrets migrate --yes)
-control/secret.env
-control/secret.gate.env
+# Secrets — PLAINTEXT scoped env files (secret.<scope>.env). This gitignore is the only thing
+# between them and an accidental commit: never remove these lines.
+secret.*.env
+control/secret.*.env
 secret.env
-secret.gate.env
-secret.worker.env
-secret.codex.env
+control/secret.env
 
 # Per-deployment hints / runtime state (recreated by setup.sh / the loop).
 control/.source-repo

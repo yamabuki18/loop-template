@@ -114,6 +114,8 @@ gs "block sops invocation"        2 "sops -d secret.worker.sops.env"
 gs "block age-keygen"             2 "age-keygen -y ~/.config/sops/age/keys.txt"
 gs "block age key cat"            2 "cat ~/.config/sops/age/keys.txt"
 gs "block secret file reference"  2 "grep TOKEN secret.gate.sops.env"
+gs "block plaintext secret cat"   2 "cat secret.worker.env"
+gs "block plaintext secret grep"  2 "grep TOKEN ../secret.codex.env"
 gs "block bare env dump"          2 "env"
 gs "block env pipe dump"          2 "env | grep KEY"
 gs "block printenv"               2 "printenv"
@@ -134,6 +136,7 @@ gsp() { # file-path form
   [ "$rc" = "$exp" ] && ok "guard-secrets(path) $desc (exit $rc)" || ko "guard-secrets(path) $desc: expected $exp got $rc"
 }
 gsp "block Read of sops env"     2 "/somewhere/secret.gate.sops.env"
+gsp "block Read of plaintext secret" 2 "/somewhere/secret.worker.env"
 gsp "block Read of age key"      2 "$HOME/.config/sops/age/keys.txt"
 gsp "block Read of ssh key"      2 "$HOME/.ssh/id_rsa"
 gsp "block Read of claude creds" 2 "$HOME/.claude/.credentials.json"
@@ -427,9 +430,46 @@ printf 'stdin plan body\n' | ( export LOOP_PROJECT="$sx/ws" HOME="$sx/home"
 arch2="$(ls "$sx/ws/memory/plans/"*-from-stdin.md 2>/dev/null | head -1)"
 [ -n "$arch2" ] && grep -q 'stdin plan body' "$arch2" \
   && ok "handoff: --plan - reads the plan from stdin" || ko "handoff: stdin variant failed"
+# Idempotence: a second handoff with the same open title must refuse, not duplicate the goal.
+if ( export LOOP_PROJECT="$sx/ws" HOME="$sx/home"
+     bash "$CTL/handoff.sh" "Add User Auth" --latest ) >/dev/null 2>&1; then
+  ko "handoff: duplicate open title was accepted"
+else
+  n="$(grep -c '^- \[ \] Add User Auth ' "$sx/ws/memory/backlog.md" 2>/dev/null || true)"
+  [ "$n" = 1 ] && ok "handoff: duplicate open title refused (backlog still has 1 entry)" \
+               || ko "handoff dedup: backlog has $n entries for the title"
+fi
+# ...but a completed goal may be re-queued (dedup only guards OPEN [ ]/[~] marks).
+sed -i 's/^- \[ \] Add User Auth /- [x] Add User Auth /' "$sx/ws/memory/backlog.md"
+if ( export LOOP_PROJECT="$sx/ws" HOME="$sx/home"
+     bash "$CTL/handoff.sh" "Add User Auth" --latest ) >/dev/null 2>&1; then
+  ok "handoff: completed [x] title may be handed off again"
+else ko "handoff: re-queue of a completed title refused"; fi
 grep -q 'decompose THAT plan faithfully' "$CTL/plan.sh" \
   && ok "plan.sh: planner instructed to honor referenced plans (no re-planning)" \
   || ko "plan.sh: handoff instruction missing from the planner prompt"
+
+echo "== scaffold.sh (legacy full-copy: re-run guard) =="
+sct="$(mktemp -d)/proj"
+if bash "$CTL/scaffold.sh" "$sct" >/dev/null 2>&1; then
+  ok "scaffold: first run succeeds"
+else ko "scaffold: first run failed"; fi
+[ -e "$sct/control/lib.sh" ] && [ -f "$sct/memory/backlog.md" ] \
+  && ok "scaffold: control/ + memory/ laid down" || ko "scaffold: layout incomplete"
+if ls "$sct"/control/secret.*.env >/dev/null 2>&1; then
+  ko "scaffold: plaintext secrets leaked into the new project"
+else ok "scaffold: no plaintext secrets carried over"; fi
+printf '# BACKLOG\n\n## Goals\n- [ ] precious user goal\n' > "$sct/memory/backlog.md"
+if bash "$CTL/scaffold.sh" "$sct" >/dev/null 2>&1; then
+  ko "scaffold: re-run onto an existing scaffold was accepted"
+else ok "scaffold: re-run refused (not re-run-safe by design)"; fi
+grep -q 'precious user goal' "$sct/memory/backlog.md" \
+  && ok "scaffold: refused re-run left the user's backlog untouched" \
+  || ko "scaffold: re-run clobbered the backlog"
+[ ! -e "$sct/control/control" ] \
+  && ok "scaffold: no nested control/control after refused re-run" \
+  || ko "scaffold: nested control/control appeared"
+rm -rf "$(dirname "$sct")"
 jq -e '.hooks.PostToolUse[] | select(.matcher=="ExitPlanMode")' "$svd/settings.json" >/dev/null 2>&1 \
   && ok "supervise: plan-capture wired on ExitPlanMode" \
   || ko "supervise: plan-capture hook missing from supervisor settings"
@@ -455,52 +495,50 @@ out="$( export LOOP_PROJECT="$sx/ws" HOME="$sx/home" CLAUDE_CODE_OAUTH_TOKEN=dum
   || ko "loop.sh did not refuse (rc=$rc)"
 rm -rf "$sx"
 
-echo "== lib: secret_exec (scoped injection, backend contract) =="
+echo "== lib: secret_exec (scoped plaintext injection) =="
 ws="$(mktemp -d)"; touch "$ws/.loop-workspace"
-bin="$(mktemp -d)"
-# Fake sops: mimics `sops exec-env <file> <one-command-string>` — sources the dotenv file
-# (our fixture is plain text) into the child env and runs the command via sh -c.
-cat > "$bin/sops" <<'SHIM'
-#!/usr/bin/env bash
-echo "$*" >> "${FAKE_SOPS_LOG:-/dev/null}"
-if [ "$1" = "exec-env" ]; then
-  f="$2"; cmd="$3"
-  set -a; . "$f"; set +a
-  exec sh -c "$cmd"
-fi
-exit 0
-SHIM
-chmod +x "$bin/sops"
-printf 'CLAUDE_CODE_OAUTH_TOKEN=tok123\nANTHROPIC_API_KEY=key456\n' > "$ws/secret.worker.sops.env"
-export FAKE_SOPS_LOG="$ws/sops.log"
-outv="$( (export LOOP_PROJECT="$ws" PATH="$bin:$PATH"
+bin="$(mktemp -d)"   # shim dir; later sections (fake codex) install binaries here
+printf 'CLAUDE_CODE_OAUTH_TOKEN=tok123\nANTHROPIC_API_KEY=key456\n' > "$ws/secret.worker.env"
+outv="$( (export LOOP_PROJECT="$ws"
           source "$CTL/lib.sh"
           secret_exec worker -- sh -c 'echo "${ANTHROPIC_API_KEY:-EMPTY}:${CLAUDE_CODE_OAUTH_TOKEN:-EMPTY}"') 2>/dev/null )"
 if [ "$outv" = "EMPTY:tok123" ]; then
   ok "secret_exec worker: OAuth precedence strips ANTHROPIC_API_KEY in the child env"
 else ko "secret_exec precedence: got '$outv' (want EMPTY:tok123)"; fi
-grep -q "exec-env $ws/secret.worker.sops.env" "$FAKE_SOPS_LOG" \
-  && ok "secret_exec routes through 'sops exec-env <file> <one-string>'" \
-  || ko "secret_exec: sops argv wrong ($(cat "$FAKE_SOPS_LOG" 2>/dev/null))"
-: > "$FAKE_SOPS_LOG"
-outv="$( (export LOOP_PROJECT="$ws" PATH="$bin:$PATH"; source "$CTL/lib.sh"; secret_exec gate -- echo bare-ok) 2>/dev/null )"
-if [ "$outv" = "bare-ok" ] && [ ! -s "$FAKE_SOPS_LOG" ]; then
-  ok "secret_exec: missing scope file runs the command bare (no sops call)"
-else ko "secret_exec bare: got '$outv' (sops log: $(cat "$FAKE_SOPS_LOG" 2>/dev/null))"; fi
-# quoting robustness: args with spaces/quotes must survive the single-string contract
-outv="$( (export LOOP_PROJECT="$ws" PATH="$bin:$PATH"; source "$CTL/lib.sh"
+# scope isolation: the values must exist ONLY in the child, never in the sourcing shell
+outv="$( (export LOOP_PROJECT="$ws"; source "$CTL/lib.sh"
+          secret_exec worker -- true
+          echo "${CLAUDE_CODE_OAUTH_TOKEN:-CLEAN}") 2>/dev/null )"
+[ "$outv" = "CLEAN" ] \
+  && ok "secret_exec: values never leak into the calling shell" \
+  || ko "secret_exec isolation: got '$outv' (want CLEAN)"
+outv="$( (export LOOP_PROJECT="$ws"; source "$CTL/lib.sh"; secret_exec gate -- echo bare-ok) 2>/dev/null )"
+[ "$outv" = "bare-ok" ] \
+  && ok "secret_exec: missing scope file runs the command bare" \
+  || ko "secret_exec bare: got '$outv'"
+# quoting robustness: args with spaces/quotes must survive the sh -c re-exec
+outv="$( (export LOOP_PROJECT="$ws"; source "$CTL/lib.sh"
           secret_exec worker -- printf '%s|%s' "two words" "it's quoted") 2>/dev/null )"
 [ "$outv" = "two words|it's quoted" ] \
   && ok "secret_exec: shell_quote preserves spaces and quotes" \
   || ko "secret_exec quoting: got '$outv'"
-# plain backend
+# gate scope injects independently of worker scope
 printf 'GATE_TOKEN=g789\n' > "$ws/secret.gate.env"
-outv="$( (export LOOP_PROJECT="$ws" SECRET_BACKEND=plain; source "$CTL/lib.sh"
-          secret_exec gate -- sh -c 'echo "${GATE_TOKEN:-EMPTY}"') 2>/dev/null )"
-[ "$outv" = "g789" ] && ok "secret_exec plain backend injects the scope env" || ko "secret_exec plain: got '$outv'"
-# auth_mode probes without leaking (fake sops again)
-outv="$( (export LOOP_PROJECT="$ws" PATH="$bin:$PATH"; source "$CTL/lib.sh"; auth_mode) 2>/dev/null )"
+outv="$( (export LOOP_PROJECT="$ws"; source "$CTL/lib.sh"
+          secret_exec gate -- sh -c 'echo "${GATE_TOKEN:-EMPTY}:${CLAUDE_CODE_OAUTH_TOKEN:-EMPTY}"') 2>/dev/null )"
+[ "$outv" = "g789:EMPTY" ] && ok "secret_exec gate: scope file injected, worker values absent" || ko "secret_exec gate scope: got '$outv'"
+# auth_mode probes without leaking
+outv="$( (export LOOP_PROJECT="$ws"; source "$CTL/lib.sh"; auth_mode) 2>/dev/null )"
 [ "$outv" = "subscription" ] && ok "auth_mode: subscription detected via probe (no value printed)" || ko "auth_mode: got '$outv'"
+# an empty seeded template must NOT count as a configured secret (host fallback stays alive)
+tpl="$(mktemp -d)"; touch "$tpl/.loop-workspace"
+printf '# template only\nCLAUDE_CODE_OAUTH_TOKEN=\n' > "$tpl/secret.worker.env"
+outv="$( (export LOOP_PROJECT="$tpl"; source "$CTL/lib.sh"
+          secret_present worker && echo present || echo absent) 2>/dev/null )"
+[ "$outv" = "absent" ] \
+  && ok "secret_present: empty template file does not count as configured" \
+  || ko "secret_present template: got '$outv' (want absent)"
+rm -rf "$tpl"
 
 echo "== lib: codex_gate_policy (advise/block round accounting) =="
 mkdir -p "$ws/state"
@@ -981,6 +1019,14 @@ oc "garbage line"             1 'not json at all'
   && ok "ontology-check: absent graph is fine (rc 0)" || ko "ontology-check: absent graph should pass"
 ( export LOOP_PROJECT="$ow"; bash "$CTL/ontology-check.sh" ) >/dev/null 2>&1 \
   && ok "ontology-check: validates the real event graph (rc 0)" || ko "ontology-check failed on ontology_event output"
+# Auto-wired validation: a corrupt graph makes digest refresh WARN (PROGRESS) but never fail —
+# the check runs inside the loop now, not only when someone remembers `loop ontology-check`.
+printf 'not json at all\n' >> "$g"
+if ( export LOOP_PROJECT="$ow"; source "$CTL/lib.sh"; ontology_digest_refresh ) >/dev/null 2>&1; then
+  grep -q $'\tONTOLOGY_INVALID\t' "$ow/memory/PROGRESS.md" 2>/dev/null \
+    && ok "digest refresh: corrupt graph logged as ONTOLOGY_INVALID (rc stays 0)" \
+    || ko "digest refresh: corrupt graph not reported to PROGRESS"
+else ko "digest refresh: corrupt graph broke the rc-0 contract"; fi
 rm -rf "$ow"
 
 echo "== lib: escalation_report (verifier co-evolution seam) =="
@@ -1267,13 +1313,7 @@ printf '%s\n' "$@" > "${FAKE_CURL_CAPTURE:-/dev/null}"
 printf '%s' "${FAKE_CURL_BODY:-}"
 SHIM
 chmod +x "$ubin/curl"
-cat > "$ubin/sops" <<'SHIM'
-#!/usr/bin/env bash
-if [ "$1" = "exec-env" ]; then f="$2"; cmd="$3"; set -a; . "$f"; set +a; exec sh -c "$cmd"; fi
-exit 0
-SHIM
-chmod +x "$ubin/sops"
-printf 'CLAUDE_CODE_OAUTH_TOKEN=tok123\n' > "$uw/secret.worker.sops.env"
+printf 'CLAUDE_CODE_OAUTH_TOKEN=tok123\n' > "$uw/secret.worker.env"
 UBODY='{"five_hour":{"utilization":42.0,"resets_at":"2026-02-06T22:00:00+00:00"},"seven_day":{"utilization":14.4,"resets_at":"2026-02-12T20:00:00+00:00"}}'
 exp_fr="$(date -u -d '2026-02-06T22:00:00+00:00' +%s)"
 exp_sr="$(date -u -d '2026-02-12T20:00:00+00:00' +%s)"
@@ -1411,6 +1451,12 @@ grep -q 'GOAL_INCOMPLETE' "$CTL/loop.sh" && grep -q "mark_goal '!'" "$CTL/loop.s
 grep -q 'gate_now_decision' "$CTL/loop.sh" && grep -q 'gate_now_decision' "$CTL/watch.sh" \
   && ok "loop.sh + watch.sh: burst gating via shared gate_now_decision" \
   || ko "burst gating still duplicated"
+# Worker-pool bring-up is the SHARED lib helper in all three launchers (no drifting copies).
+if grep -q 'spawn_pool' "$CTL/loop.sh" && grep -q 'spawn_pool' "$CTL/up.sh" \
+   && grep -q 'spawn_pool' "$CTL/supervise.sh" \
+   && ! grep -q 'seq 1 "\$WORKER_COUNT".*spawn\.sh' "$CTL/loop.sh" "$CTL/up.sh" "$CTL/supervise.sh"; then
+  ok "loop.sh + up.sh + supervise.sh: pool bring-up via shared spawn_pool"
+else ko "worker-pool bring-up still duplicated"; fi
 grep -q 'F2P' "$CTL/verify.sh" \
   && ok "verify.sh: feedback explains F2P vs P2P failures" \
   || ko "verify.sh: F2P/P2P explanation missing"

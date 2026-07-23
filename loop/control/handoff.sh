@@ -29,6 +29,18 @@ done
 [ -n "$TITLE" ] || die "usage: handoff.sh \"<goal title>\" [--latest | --plan <file>|-]"
 : "${PLAN_SRC:=$MEMORY_DIR/plans/latest.md}"
 
+# Idempotence: an open goal ([ ] queued or [~] in progress) with this exact title must not be
+# queued twice — a re-run (double-enter, retried hook) would otherwise make the loop implement
+# the same plan twice. Completed ([x]) / escalated ([!]) titles may be re-queued deliberately.
+BACKLOG="$MEMORY_DIR/backlog.md"
+if [ -f "$BACKLOG" ] && awk -v t="$TITLE" '
+    /^- \[[ ~]\] / { line=$0; sub(/^- \[[ ~]\] /, "", line)
+                     sub(/ \(plan: [^)]*\)[[:space:]]*$/, "", line)
+                     if (line == t) found = 1 }
+    END { exit found ? 0 : 1 }' "$BACKLOG"; then
+  die "an open goal titled '$TITLE' is already in the backlog — remove that line first, or hand off under a different title."
+fi
+
 mkdir -p "$MEMORY_DIR/plans"
 slug="$(printf '%s' "$TITLE" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]\+/-/g' -e 's/^-*//' -e 's/-*$//' | cut -c1-48)"
 [ -n "$slug" ] || slug="plan"
@@ -42,7 +54,6 @@ else
 fi
 [ -s "$dest" ] || { rm -f "$dest"; die "plan is empty — nothing to hand off."; }
 
-BACKLOG="$MEMORY_DIR/backlog.md"
 [ -f "$BACKLOG" ] || printf '# Backlog\n\n' > "$BACKLOG"
 printf -- '- [ ] %s (plan: memory/plans/%s)\n' "$TITLE" "$(basename "$dest")" >> "$BACKLOG"
 progress_log HANDOFF "-" "-" "$TITLE -> $(basename "$dest")"

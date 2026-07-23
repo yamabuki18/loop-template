@@ -28,7 +28,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ -d "$CANONICAL/.git" ] || die "canonical not found — run ./control/setup.sh first."
-have_credential || die "no credential: run 'claude setup-token' then 'loop secrets edit worker' (or log in to claude on this host)."
+have_credential || die "no credential: run 'claude setup-token' and paste it into secret.worker.env (or log in to claude on this host)."
 command -v claude >/dev/null 2>&1 || die "claude CLI not found on the host."
 # Exclusivity: loop.sh auto-assigns and auto-lands — it would fight an interactive supervisor.
 if pid="$(heartbeat_pid_alive loop)"; then
@@ -39,7 +39,7 @@ fi
 mapfile -t WORKERS < <(worker_tasks)
 if [ "${#WORKERS[@]}" -eq 0 ]; then
   echo "supervise: bringing up $WORKER_COUNT workers..."
-  for i in $(seq 1 "$WORKER_COUNT"); do "$CONTROL_DIR/spawn.sh" "w$i" >/dev/null; done
+  spawn_pool
   mapfile -t WORKERS < <(worker_tasks)
 fi
 

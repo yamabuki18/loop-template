@@ -3,7 +3,7 @@
 #
 #   ./control/scaffold.sh <target-dir> [repo-url]
 #       Lay the loop template into <target-dir> (control/ + skills/ + memory/ + README/.gitignore),
-#       ready for you to fill in config.env/secret.env/skills and run ./control/setup.sh there.
+#       ready for you to fill in config.env/secret.worker.env/skills and run ./control/setup.sh there.
 #       If [repo-url] is given it is recorded as a hint for setup.sh (which clones canonical).
 #       NOTE: this is the LEGACY full-copy deployment (engine updates do NOT propagate). Prefer
 #       `loop init <dir>` (bin/loop) — one central engine, thin per-project workspaces.
@@ -35,7 +35,12 @@ fi
 TARGET="${1:?usage: scaffold.sh <target-dir> [repo-url]   |   scaffold.sh --install-host-guard}"
 REPO="${2:-}"
 mkdir -p "$TARGET"
-[ -z "$(ls -A "$TARGET" 2>/dev/null)" ] || echo "scaffold: note — $TARGET is not empty; existing files are kept, template files are added."
+# Re-run guard: this legacy full-copy path is NOT convergent — `cp -r` onto an existing
+# control/skills/memory would nest (control/control) and clobber user edits (backlog, skills).
+# Refuse instead of guessing (the maintained re-runnable path is `loop init` / `loop here`).
+for d in control skills memory; do
+  [ ! -e "$TARGET/$d" ] || die "scaffold: $TARGET already contains $d/ — refusing to re-scaffold over it (not re-run-safe). Prefer 'loop init'/'loop here', or remove the previous scaffold first."
+done
 
 echo "scaffold: copying template into $TARGET …"
 cp -r "$CONTROL_DIR"            "$TARGET/control"
@@ -44,10 +49,10 @@ cp -r "$MEMORY_DIR"            "$TARGET/memory"  2>/dev/null || true
 [ -f "$ROOT/.gitignore" ] && cp "$ROOT/.gitignore" "$TARGET/.gitignore"
 [ -f "$ROOT/README.md" ]  && cp "$ROOT/README.md"  "$TARGET/README.md"
 # Never carry secrets or per-run state into a new project.
-rm -f  "$TARGET"/control/secret.*.env "$TARGET"/control/secret.*.sops.env \
-       "$TARGET/control/.sops.yaml" "$TARGET/control/.source-repo"
+rm -f  "$TARGET"/control/secret.*.env "$TARGET/control/.source-repo"
 rm -rf "$TARGET/state" "$TARGET/worktrees" "$TARGET/review" "$TARGET/canonical"
-# Fresh memory for the new project.
+# Fresh memory for the new project (safe: the guard above proved memory/ did not pre-exist,
+# so this only normalizes the engine's own copied backlog, never a user's).
 printf '# BACKLOG\n\n## Goals\n- [ ] <first goal>\n\n## Done\n' > "$TARGET/memory/backlog.md" 2>/dev/null || true
 
 [ -n "$REPO" ] && echo "$REPO" > "$TARGET/control/.source-repo"
@@ -60,8 +65,8 @@ cat <<EOF
 
 scaffold: done. Next, in $TARGET:
   1. edit control/config.env        (PROJECT_NAME, BASE_BRANCH, CHECK_CMD, loop knobs)
-  2. claude setup-token && bash ./control/secrets.sh init && bash ./control/secrets.sh edit worker
-     -> the credential lives sops-encrypted; never as a plaintext file
+  2. claude setup-token, then paste the token into control/secret.worker.env
+     (copy from control/secret.worker.env.example; plaintext, gitignored)
   3. fill in skills/VISION.md, skills/ARCHITECTURE.md, skills/RULES.md
   4. bash ./control/setup.sh ${REPO:+$REPO}
   5. write goals in memory/backlog.md, then ./control/up.sh  (loop pane is pre-armed)

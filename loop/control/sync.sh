@@ -41,8 +41,8 @@ for TASK in "${tasks[@]}"; do
         echo "sync: '$TASK' is busy (agent working) — deferred."
         progress_log SYNC_DEFERRED "$TASK" "$BRANCH" "agent working; will retry on next land"
         exit 0 ;;
-      idle|blocked|done)
-        : ;;  # herdr confirms the worker is not mid-burst — safe to proceed.
+      idle|blocked|"done")
+        : ;;  # herdr confirms the worker is not mid-burst — safe to proceed. (done quoted: SC1010)
       *)
         # Unknown/none: herdr can't confirm. Defer if the worktree committed too recently.
         last="$(git -C "$WT" log -1 --format=%ct 2>/dev/null || echo 0)"
